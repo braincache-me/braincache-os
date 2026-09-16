@@ -88,8 +88,7 @@ streams progress. Per recording:
 The transcript then behaves like any other transcript: the agent can read it
 with `read_transcript`, or transcribe a recording on demand mid-analysis with
 `transcribe_recording`. Already-transcribed recordings are read from disk, never
-re-billed. If the configured omni model id is rejected, the client asks
-`GET /models` once and retries with the served omni id.
+re-billed.
 
 Endpoints: `GET /api/projects/:id/recordings` lists recordings and whether each
 has a transcript; `POST /api/projects/:id/transcribe` (SSE) transcribes the ones
@@ -104,7 +103,13 @@ that don't, or the `paths` you name.
 | `NEMOTRON_FAST_MODEL` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | Chat follow-ups |
 | `NEMOTRON_AGENT_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | Analysis loop + skills |
 | `NEMOTRON_REASONING_MODEL` | `nvidia/Nemotron-3-Ultra-550b-a55b` | Goal grouping pass |
-| `NEMOTRON_OMNI_MODEL` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning` | Audio + vision (auto-resolved from `GET /models` if the id is wrong) |
+| `NEMOTRON_OMNI_MODEL` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning` | Audio + vision |
+
+Model ids are the part of this configuration most likely to drift. If the
+provider rejects one as unknown, the client asks `GET /models` what it actually
+serves, picks the model matching that role (nano, super, ultra or omni),
+remembers it for the rest of the process, and retries the request once. A wrong
+id therefore costs one extra round trip instead of breaking the feature.
 | `AI_MAX_TOOL_ROUNDS` | `8` | Tool-calling rounds per run |
 | `AI_MAX_TOOL_CALLS` | `14` | Total tool calls per run |
 | `AI_TIMEOUT_MS` | `240000` | Per chat-completions request |

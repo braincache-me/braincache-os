@@ -66,7 +66,9 @@ Environment variables (see `.env.example`):
 | `NEMOTRON_FAST_MODEL` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | Nano |
 | `NEMOTRON_AGENT_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | Super |
 | `NEMOTRON_REASONING_MODEL` | `nvidia/Nemotron-3-Ultra-550b-a55b` | Ultra |
-| `NEMOTRON_OMNI_MODEL` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning` | Omni (audio + vision); auto-resolved from `GET /models` if the ID differs |
+| `NEMOTRON_OMNI_MODEL` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning` | Omni (audio + vision) |
+
+If the provider rejects any of these ids as unknown, the client asks `GET /models` what it serves, picks the model for that role, and retries once.
 
 ### 3. macOS app
 

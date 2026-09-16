@@ -146,44 +146,65 @@ export function repairRejectedBody(body, error) {
   return null;
 }
 
-// Same as chatCompletion, but the model is the omni role and a "model not
-// found" reply triggers a one-time lookup of the served omni model id.
-export async function omniChatCompletion(body, options = {}) {
+// Chat completion for one model role, with model-id self-repair: if the
+// provider says the configured id does not exist, ask GET /models what it
+// actually serves for that role and retry once.
+export async function roleChatCompletion(role, body, options = {}) {
   const config = options.config || getProviderConfig();
-  const model = await resolveOmniModel({ config });
+  const model = await resolveModel(role, { config });
   try {
     return await chatCompletion({ ...body, model }, { ...options, config });
   } catch (error) {
-    if (!looksLikeMissingModel(error) || config.provider !== "nebius") throw error;
-    const discovered = await resolveOmniModel({ config, force: true });
+    if (!looksLikeMissingModel(error) || config.provider === "openai") throw error;
+    const discovered = await resolveModel(role, { config, force: true });
     if (!discovered || discovered === model) throw error;
-    console.warn(`[ai] omni model "${model}" not found; retrying with "${discovered}" from GET /models.`);
+    console.warn(`[ai] model "${model}" not found; retrying with "${discovered}" from GET /models.`);
     return chatCompletion({ ...body, model: discovered }, { ...options, config });
   }
 }
 
-let omniModelCache = null;
+// The omni role, which is how audio and screenshots reach the provider.
+export function omniChatCompletion(body, options = {}) {
+  return roleChatCompletion("omni", body, options);
+}
 
-// The omni model id is the least certain of the defaults. When the configured
-// id is rejected we ask the provider which models it serves, pick the first
-// one matching /omni/i, and cache it for the process lifetime.
-export async function resolveOmniModel({ config = getProviderConfig(), force = false } = {}) {
-  if (omniModelCache && !force) return omniModelCache;
-  if (!force) {
-    omniModelCache = config.models.omni;
-    return omniModelCache;
+// How to recognise a served model for each role when the configured id is
+// wrong. Nemotron 3 Nano Omni also matches /nano/, so `fast` excludes it.
+const ROLE_MATCHERS = Object.freeze({
+  fast: (id) => /nemotron/i.test(id) && /nano/i.test(id) && !/omni/i.test(id),
+  agent: (id) => /nemotron/i.test(id) && /super/i.test(id),
+  reasoning: (id) => /nemotron/i.test(id) && /ultra/i.test(id),
+  omni: (id) => /omni/i.test(id)
+});
+
+const resolvedModels = new Map();
+
+// The configured id for a role, or — after `force` — the one the provider says
+// it serves. Model ids are the least certain part of the configuration, so a
+// rejected id is looked up rather than left to fail every later call.
+export async function resolveModel(role, { config = getProviderConfig(), force = false } = {}) {
+  const configured = config.models[role];
+  if (!force) return resolvedModels.get(role) || configured;
+
+  const served = await listModels({ config });
+  const matcher = ROLE_MATCHERS[role];
+  const match = matcher ? served.find(matcher) : null;
+  if (!match) {
+    console.warn(`[ai] GET /models lists no model for role "${role}"; keeping "${configured}".`);
+    return resolvedModels.get(role) || configured;
   }
-  const models = await listModels({ config });
-  const match = models.find((id) => /omni/i.test(id));
-  if (match) {
-    omniModelCache = match;
-    console.log(`[ai] resolved omni model via GET /models: ${match}`);
-  }
-  return omniModelCache || config.models.omni;
+  resolvedModels.set(role, match);
+  console.log(`[ai] resolved "${role}" model via GET /models: ${match}`);
+  return match;
+}
+
+// Kept for callers that only care about the omni role.
+export function resolveOmniModel(options = {}) {
+  return resolveModel("omni", options);
 }
 
 export function resetProviderCache() {
-  omniModelCache = null;
+  resolvedModels.clear();
 }
 
 export async function listModels({ config = getProviderConfig() } = {}) {

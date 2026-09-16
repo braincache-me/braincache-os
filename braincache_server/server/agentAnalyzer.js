@@ -17,11 +17,11 @@ import { resolveMediaPath } from "./activityParser.js";
 import { eventLabel, inferTasks, computeTaskMetrics } from "./taskInference.js";
 import { generateSkillMarkdown } from "./skillGenerator.js";
 import {
-  chatCompletion,
   getProviderConfig,
   messageText,
   messageToolCalls,
   omniChatCompletion,
+  roleChatCompletion,
   stripThinkTags
 } from "./aiProvider.js";
 import { transcribeRecording, transcriptExists, transcriptPathForRecording } from "./transcription.js";
@@ -180,6 +180,7 @@ export async function chatWithAgentStream(
     const answer = await runAgentLoop({
       config,
       model: chatModel,
+      role: "fast",
       toolContext: { events, activityRoot, config, emit },
       systemPrompt: chatSystemPrompt(analysis),
       messages: [...historyMessages(history), { role: "user", content: String(message || "") }],
@@ -217,13 +218,13 @@ export function historyMessages(history = [], limit = 20) {
 // answer in text instead of calling again.
 // ---------------------------------------------------------------------------
 
-async function runAgentLoop({ config, model, toolContext, systemPrompt, messages: seed, emit, maxRounds, maxCalls }) {
+async function runAgentLoop({ config, model, role = "agent", toolContext, systemPrompt, messages: seed, emit, maxRounds, maxCalls }) {
   const tools = buildToolDefinitions();
   const rounds = maxRounds ?? config.limits.maxToolRounds;
   const callBudget = maxCalls ?? config.limits.maxToolCalls;
   const messages = [{ role: "system", content: systemPrompt }, ...seed];
 
-  const ask = (toolChoice) => chatCompletion({
+  const ask = (toolChoice) => roleChatCompletion(role, {
     model,
     messages,
     tools,
@@ -309,7 +310,7 @@ async function planGoals({ tasks, targetGoals, rawGoals, config, emit }) {
 
   await emit({ type: "thinking", message: `Grouping ${tasks.length} task(s) into business goals with ${model}…` });
   try {
-    const response = await chatCompletion({
+    const response = await roleChatCompletion("reasoning", {
       model,
       messages: [
         { role: "system", content: goalSystemPrompt() },

@@ -14,6 +14,8 @@ import {
   omniChatCompletion,
   repairRejectedBody,
   resetProviderCache,
+  resolveModel,
+  roleChatCompletion,
   stripThinkTags
 } from "../server/aiProvider.js";
 
@@ -185,6 +187,73 @@ test("omni requests rediscover the served model id via GET /models", async () =>
       "/chat/completions"
     ]);
     assert.equal(fetchMock.calls[2].body.model, "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning");
+  } finally {
+    fetchMock.restore();
+    resetProviderCache();
+  }
+});
+
+test("every model role rediscovers its served id, not just omni", async () => {
+  const served = {
+    data: [
+      { id: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B" },
+      { id: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning" },
+      { id: "nvidia/nemotron-3-super-120b-a12b" },
+      { id: "nvidia/Nemotron-3-Ultra-550b-a55b" },
+      { id: "Qwen/Qwen3-Embedding-8B" }
+    ]
+  };
+  const cases = [
+    ["fast", "NEMOTRON_FAST_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"],
+    ["agent", "NEMOTRON_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b"],
+    ["reasoning", "NEMOTRON_REASONING_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b"],
+    ["omni", "NEMOTRON_OMNI_MODEL", "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"]
+  ];
+
+  for (const [role, envVar, expected] of cases) {
+    resetProviderCache();
+    const config = getProviderConfig({ NEBIUS_API_KEY: "nk-test", [envVar]: "nvidia/wrong-id" });
+    const fetchMock = mockFetch(({ url, index }) => {
+      if (url.endsWith("/models")) return { payload: served };
+      if (index === 0) return { status: 404, payload: { error: { message: "The model `nvidia/wrong-id` does not exist." } } };
+      return { payload: chatPayload("ok") };
+    });
+    try {
+      const response = await roleChatCompletion(role, { messages: [] }, { config });
+      assert.equal(messageText(response), "ok", role);
+      assert.equal(fetchMock.calls[2].body.model, expected, role);
+    } finally {
+      fetchMock.restore();
+      resetProviderCache();
+    }
+  }
+});
+
+test("a resolved model id is reused for later calls in the same role", async () => {
+  resetProviderCache();
+  const config = getProviderConfig({ NEBIUS_API_KEY: "nk-test", NEMOTRON_AGENT_MODEL: "nvidia/wrong-id" });
+  const fetchMock = mockFetch(({ url, index }) => {
+    if (url.endsWith("/models")) return { payload: { data: [{ id: "nvidia/nemotron-3-super-120b-a12b" }] } };
+    if (index === 0) return { status: 404, payload: { error: { message: "unknown model" } } };
+    return { payload: chatPayload("ok") };
+  });
+  try {
+    await roleChatCompletion("agent", { messages: [] }, { config });
+    await roleChatCompletion("agent", { messages: [] }, { config });
+    assert.equal(fetchMock.calls.filter((call) => call.url.endsWith("/models")).length, 1);
+    assert.equal(fetchMock.calls.at(-1).body.model, "nvidia/nemotron-3-super-120b-a12b");
+  } finally {
+    fetchMock.restore();
+    resetProviderCache();
+  }
+});
+
+test("resolveModel keeps the configured id when nothing served matches the role", async () => {
+  resetProviderCache();
+  const config = getProviderConfig({ NEBIUS_API_KEY: "nk-test", NEMOTRON_REASONING_MODEL: "nvidia/keep-me" });
+  const fetchMock = mockFetch(() => ({ payload: { data: [{ id: "Qwen/Qwen3-Embedding-8B" }] } }));
+  try {
+    assert.equal(await resolveModel("reasoning", { config, force: true }), "nvidia/keep-me");
   } finally {
     fetchMock.restore();
     resetProviderCache();
