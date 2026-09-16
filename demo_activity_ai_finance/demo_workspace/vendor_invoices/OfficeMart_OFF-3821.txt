@@ -1,0 +1,7 @@
+OFFICEMART
+Invoice: OFF-3821
+Invoice date: 2026-05-08
+
+Supplies for design team: $346.18
+Receipt matched to card transaction on 2026-05-09.
+No follow-up required.

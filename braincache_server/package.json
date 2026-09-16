@@ -1,0 +1,15 @@
+{
+  "name": "braincache-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local server and React console for exploring BrainCache Activity Capture logs.",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning server/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

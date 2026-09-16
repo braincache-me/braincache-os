@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="github-dark.min.css">
+<script src="marked.min.js"></script>
+<script src="highlight.min.js"></script>
+<script src="mermaid.min.js"></script>
+<style>
+  :root {
+    color-scheme: dark;
+    --fg: rgba(255,255,255,0.95);
+    --fg-muted: rgba(255,255,255,0.65);
+    --bg-code: rgba(0,0,0,0.35);
+    --border: rgba(255,255,255,0.12);
+    --link: #4ea3ff;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--fg);
+    -webkit-text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    font: 13px -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    line-height: 1.45;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+  }
+  /* Non-scrollable mode (chat bubbles): host AppKit view sizes itself to
+     content, so the document must not show a scrollbar of its own. */
+  html, body { overflow: hidden; }
+  /* Scrollable mode (AI Assist panel): the web view IS the scroll surface,
+     so we re-enable vertical scrolling. */
+  body.scrollable, html.scrollable { overflow-y: auto; overflow-x: hidden; }
+  body {
+    padding: 8px 12px 12px 12px;
+  }
+  body.compact {
+    padding: 0;
+    font-size: 12.5px;
+  }
+  body.scrollable {
+    padding: 8px 14px 16px 14px;
+  }
+  p { margin: 0 0 8px 0; }
+  p:last-child { margin-bottom: 0; }
+  h1, h2, h3, h4, h5, h6 {
+    margin: 12px 0 6px 0;
+    line-height: 1.25;
+    font-weight: 600;
+  }
+  h1 { font-size: 1.45em; }
+  h2 { font-size: 1.25em; }
+  h3 { font-size: 1.1em; }
+  h4, h5, h6 { font-size: 1em; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul, ol { margin: 4px 0 8px 0; padding-left: 22px; }
+  li { margin: 2px 0; }
+  li > p { margin: 0; }
+  blockquote {
+    margin: 6px 0;
+    padding: 4px 10px;
+    border-left: 3px solid var(--border);
+    color: var(--fg-muted);
+  }
+  hr {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: 12px 0;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+  }
+  /* inline code */
+  :not(pre) > code {
+    background: var(--bg-code);
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    margin: 8px 0;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
+    position: relative;
+    /* Reserve room at the bottom for the copy button so it never overlaps
+       the final line of code. */
+    padding-bottom: 28px;
+  }
+  pre code.hljs {
+    background: transparent;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  .code-block {
+    position: relative;
+  }
+  .code-lang {
+    position: absolute;
+    top: 4px;
+    right: 10px;
+    font-size: 10px;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    user-select: none;
+    pointer-events: none;
+  }
+  .copy-btn {
+    position: absolute;
+    bottom: 6px;
+    right: 8px;
+    font-size: 10px;
+    color: var(--fg-muted);
+    background: rgba(255,255,255,0.08);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 8px;
+    cursor: pointer;
+    opacity: 0.85;
+    transition: opacity 0.15s, color 0.15s, background 0.15s;
+  }
+  pre:hover .copy-btn { opacity: 1; }
+  .copy-btn:hover { color: var(--fg); background: rgba(255,255,255,0.16); }
+  table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: rgba(255,255,255,0.05);
+    font-weight: 600;
+  }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.025); }
+  img { max-width: 100%; height: auto; }
+  .mermaid {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    margin: 8px 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  .mermaid svg { max-width: 100%; height: auto; }
+  .mermaid-error {
+    color: #ff8080;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<div id="content"></div>
+<script>
+(function() {
+  "use strict";
+
+  // ---- marked setup ----------------------------------------------------
+  // Custom renderer: capture mermaid fences as <div class="mermaid"> so we
+  // can post-process them; everything else goes through marked's defaults
+  // plus highlight.js for syntax colouring.
+  const renderer = new marked.Renderer();
+  const defaultCodeRenderer = renderer.code.bind(renderer);
+  renderer.code = function(code, infostring, escaped) {
+    const lang = (infostring || "").trim().toLowerCase();
+    if (lang === "mermaid") {
+      // Store raw source; renderMermaid() will replace innerHTML on render.
+      const encoded = encodeURIComponent(code);
+      return '<div class="mermaid" data-src="' + encoded + '">' + escapeHtml(code) + '</div>';
+    }
+    let highlighted = code;
+    let displayLang = lang;
+    try {
+      if (lang && hljs.getLanguage(lang)) {
+        highlighted = hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+      } else {
+        const auto = hljs.highlightAuto(code);
+        highlighted = auto.value;
+        displayLang = auto.language || "";
+      }
+    } catch (e) {
+      highlighted = escapeHtml(code);
+    }
+    const langLabel = displayLang ? '<span class="code-lang">' + escapeHtml(displayLang) + '</span>' : '';
+    const copy = '<button class="copy-btn" onclick="window.__copyCode(this)">Copy</button>';
+    return '<pre class="code-block">' + langLabel + copy + '<code class="hljs language-' + escapeHtml(displayLang) + '">' + highlighted + '</code></pre>';
+  };
+
+  // Open links in the system browser (handled by Swift via navigation
+  // policy); marked default emits <a href> which is fine.
+  marked.setOptions({
+    renderer: renderer,
+    gfm: true,
+    breaks: false,
+    headerIds: false,
+    mangle: false,
+  });
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  // ---- mermaid setup ---------------------------------------------------
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: "dark",
+    securityLevel: "strict",
+    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif',
+  });
+
+  // mermaid.render attaches temporary SVGs (including the "syntax error"
+  // bomb) directly to <body> during rendering. Anything left behind after
+  // a render pass becomes visible page content — sweep them up.
+  function sweepMermaidStragglers() {
+    const stragglers = document.querySelectorAll(
+      'body > svg[id^="mermaid-"], body > svg[aria-roledescription], body > div[id^="dmermaid-"], body > div[id^="mermaid-"]'
+    );
+    stragglers.forEach(n => n.remove());
+  }
+
+  // Cache last-rendered SVG per source so we don't re-render the same
+  // diagram every keystroke during streaming.
+  const mermaidCache = new Map();
+  let mermaidCounter = 0;
+
+  async function renderMermaidBlocks(root) {
+    const blocks = root.querySelectorAll(".mermaid[data-src]");
+    for (const el of blocks) {
+      const src = decodeURIComponent(el.getAttribute("data-src") || "");
+      if (mermaidCache.has(src)) {
+        el.innerHTML = mermaidCache.get(src);
+        el.removeAttribute("data-src");
+        continue;
+      }
+      const id = "mermaid-svg-" + (++mermaidCounter);
+      try {
+        const { svg } = await mermaid.render(id, src);
+        mermaidCache.set(src, svg);
+        el.innerHTML = svg;
+        el.removeAttribute("data-src");
+      } catch (err) {
+        // Don't burn the visual budget on an error bomb — show the raw
+        // source as a code block so the user can still read it. We leave
+        // `data-src` in place so the next render pass (after the fence
+        // closes and the syntax becomes valid) will try again.
+        el.innerHTML = '<pre><code>' + escapeHtml(src) + '</code></pre>';
+      }
+      // Whether render succeeded or failed, mermaid leaves DOM crumbs in
+      // <body>. Clean them up before the next iteration so they can't
+      // bleed into the visible page.
+      sweepMermaidStragglers();
+    }
+    sweepMermaidStragglers();
+  }
+
+  // While a markdown stream is still inside a mermaid fence (opening
+  // ```mermaid but no closing ``` yet), mermaid will throw a syntax error
+  // on every token. Skip parsing the unclosed block until the fence
+  // closes — render a "preparing" placeholder in its place.
+  function maskIncompleteMermaid(text) {
+    const lastOpen = text.lastIndexOf("```mermaid");
+    if (lastOpen < 0) return text;
+    // Search for a closing fence AFTER the opener.
+    const after = text.slice(lastOpen + "```mermaid".length);
+    if (/\n```/.test(after)) return text; // closed
+    return text.slice(0, lastOpen) + "\n_Rendering Mermaid diagram…_\n";
+  }
+
+  // ---- size reporting --------------------------------------------------
+  // Swift listens for body height changes via this handler. We coalesce
+  // notifications with rAF to avoid flooding the bridge during streaming.
+  let pendingNotify = false;
+  function notifySize() {
+    if (pendingNotify) return;
+    pendingNotify = true;
+    requestAnimationFrame(() => {
+      pendingNotify = false;
+      const h = Math.ceil(document.documentElement.scrollHeight);
+      try {
+        window.webkit.messageHandlers.sizeChanged.postMessage({ height: h });
+      } catch (e) { /* not on a host */ }
+    });
+  }
+  const ro = new ResizeObserver(notifySize);
+  ro.observe(document.body);
+  ro.observe(document.documentElement);
+  window.addEventListener("load", notifySize);
+
+  // ---- Public API ------------------------------------------------------
+  // setMarkdown(text) — full replace (used after each streaming token)
+  // setCompact(bool)  — toggle compact spacing for chat bubbles
+  // setBackground(bgCSS, fgCSS) — runtime tweak from Swift
+  // resetContent()    — clear before a new entry
+  const root = document.getElementById("content");
+
+  // Tracks whether the user was scrolled to the bottom before the next
+  // render pass — if so, we keep them pinned to the latest tokens.
+  function isScrolledToBottom() {
+    const el = document.scrollingElement || document.documentElement;
+    return (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
+  }
+
+  function scrollToBottom() {
+    const el = document.scrollingElement || document.documentElement;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  async function renderInto(text) {
+    const wasAtBottom = isScrolledToBottom();
+    const masked = maskIncompleteMermaid(text || "");
+    let html;
+    try {
+      html = marked.parse(masked);
+    } catch (e) {
+      html = '<pre>' + escapeHtml(String(e)) + '</pre>';
+    }
+    root.innerHTML = html;
+    await renderMermaidBlocks(root);
+    // Belt-and-suspenders: even after a fully successful render, sweep
+    // <body> in case any prior pass left stragglers we missed.
+    sweepMermaidStragglers();
+    notifySize();
+    if (document.body.classList.contains("scrollable") && wasAtBottom) {
+      // Defer to next frame so the post-render layout is settled before
+      // we measure scrollHeight again.
+      requestAnimationFrame(scrollToBottom);
+    }
+  }
+
+  window.setMarkdown = function(text) {
+    renderInto(text);
+  };
+
+  window.setCompact = function(compact) {
+    document.body.classList.toggle("compact", !!compact);
+    notifySize();
+  };
+
+  window.setScrollable = function(scrollable) {
+    document.body.classList.toggle("scrollable", !!scrollable);
+    document.documentElement.classList.toggle("scrollable", !!scrollable);
+    notifySize();
+  };
+
+  window.resetContent = function() {
+    root.innerHTML = "";
+    notifySize();
+  };
+
+  window.__copyCode = function(btn) {
+    const pre = btn.closest("pre");
+    if (!pre) return;
+    const code = pre.querySelector("code");
+    const text = code ? code.innerText : "";
+    try {
+      window.webkit.messageHandlers.copyCode.postMessage({ text: text });
+    } catch (e) {
+      // Fallback: use the clipboard API if available
+      if (navigator.clipboard) navigator.clipboard.writeText(text);
+    }
+    const original = btn.textContent;
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = original; }, 1100);
+  };
+
+  // Tell Swift the runtime is ready (used so queued setMarkdown calls fire
+  // after the page is parsed and the marked global is available).
+  try {
+    window.webkit.messageHandlers.ready.postMessage({});
+  } catch (e) { /* not hosted */ }
+})();
+</script>
+</body>
+</html>

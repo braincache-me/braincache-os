@@ -1,0 +1,77 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode build artifacts
+ClipVault/build/
+ClipVault/build-*/
+build/
+DerivedData/
+*.xcresult
+*.xccovreport
+*.xccovarchive
+*.moved-aside
+*.xcuserstate
+
+# Xcode per-user data (schemes are shared via xcshareddata)
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+
+# Since the project uses XcodeGen, the .xcodeproj is regenerated from project.yml
+ClipVault/ClipVault.xcodeproj/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+SourcePackages/
+Package.resolved
+
+# Environment and secrets
+.env
+.env.*
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# Logs
+*.log
+
+# Profiling data
+*.profraw
+*.profdata
+
+# Distribution builds
+ClipVault/dist/
+
+# Sparkle CLI tools (downloaded by scripts/install-sparkle-tools.sh)
+ClipVault/scripts/sparkle-bin/
+
+# Misc
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.hmap
+*.o
+*.swp
+*.swo
+*~
+default.profraw
+# Local build/output artifacts
+ClipVault/#/
+output/
+__pycache__/
+
+# Local pre-rebrand snapshot and scratch tooling (not source)
+.playwright-cli/
+
+# Separate repos with their own remotes — do not vendor them here as gitlinks:
+node_modules/
+braincache_server/data/

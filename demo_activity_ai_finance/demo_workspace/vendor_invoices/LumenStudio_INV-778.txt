@@ -1,0 +1,8 @@
+LUMEN STUDIO DESIGN
+Invoice: INV-778
+Invoice date: 2026-05-21
+Amount: $915.50
+
+Contract design support for Spring catalog.
+Payment hold: VAT ID is missing from the invoice.
+Follow up with Elena Ortiz before approving payment.

@@ -1,0 +1,7 @@
+From: ar@northstar-demo.example
+To: finance@northstar-demo.example
+Subject: Harbor Retail payment received
+
+Harbor Retail paid invoice AR-2026-041 on 2026-05-18.
+Amount received: $7,850.00.
+Apply the receipt against the April wholesale order and mark the AR item as paid.

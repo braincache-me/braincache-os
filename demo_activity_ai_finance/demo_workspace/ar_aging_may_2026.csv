@@ -1,0 +1,4 @@
+customer,invoice_id,invoice_date,amount,days_outstanding,status
+Harbor Retail,AR-2026-041,2026-04-24,7850.00,24,Paid 2026-05-18
+Brightline Events,AR-2026-052,2026-05-11,3920.00,18,Open
+Cedar & Co.,AR-2026-057,2026-05-20,2245.75,9,Open

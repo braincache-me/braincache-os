@@ -1,0 +1,9 @@
+date,description,amount,category,memo
+2026-05-03,Stripe payout - online orders,12840.25,Cash receipts,Batch ST-0526-A
+2026-05-07,CloudWorks Hosting INV-CW-1142,-1284.00,Software and cloud services,"Needs accrual split: May usage, June billed"
+2026-05-09,OfficeMart invoice OFF-3821,-346.18,Office supplies,Receipt attached
+2026-05-12,DeskHub subscription CHG-7741,-219.00,Subscriptions,Possible duplicate renewal
+2026-05-13,DeskHub subscription CHG-7765,-219.00,Subscriptions,Review against CHG-7741
+2026-05-18,Harbor Retail payment AR-2026-041,7850.00,Customer payment,Apply against April wholesale order
+2026-05-22,EU freelance design INV-778,-915.50,Contract labor,"VAT ID missing, follow up before close"
+2026-05-28,Bank service fee,-18.00,Bank fees,Auto-coded

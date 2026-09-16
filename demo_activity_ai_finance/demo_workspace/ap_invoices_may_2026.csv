@@ -1,0 +1,4 @@
+invoice_id,vendor,invoice_date,due_date,amount,gl_account,status,owner
+INV-CW-1142,CloudWorks Hosting,2026-05-01,2026-06-01,1284.00,6150 Software and Cloud Services,Approved,Mia Chen
+OFF-3821,OfficeMart,2026-05-08,2026-05-23,346.18,6450 Office Supplies,Matched,Noah Patel
+INV-778,Lumen Studio Design,2026-05-21,2026-06-05,915.50,6320 Contract Labor,Hold,Elena Ortiz

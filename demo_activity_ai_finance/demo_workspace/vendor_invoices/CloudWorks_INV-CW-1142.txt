@@ -1,0 +1,16 @@
+CLOUDWORKS HOSTING
+Invoice: INV-CW-1142
+Invoice date: 2026-05-01
+Due date: 2026-06-01
+
+Bill to: Northstar Studio Supply
+
+Description                         Amount
+Managed cloud hosting - May usage   $1,080.00
+Backup storage overage              $  204.00
+Total                               $1,284.00
+
+Accounting note:
+This invoice was approved by Mia Chen.
+Book to GL 6150 Software and Cloud Services.
+Accrue May usage because the cash payment posted before the close package was finalized.

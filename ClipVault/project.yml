@@ -1,0 +1,145 @@
+name: ClipVault
+options:
+  bundleIdPrefix: com.TalkFlow
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ONLY_ACTIVE_ARCH: NO
+    ARCHS: "arm64 x86_64"
+    VALID_ARCHS: "arm64 x86_64"
+
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "6.29.3"
+  HotKey:
+    url: https://github.com/soffes/HotKey
+    from: "0.2.0"
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
+  ArgumentParser:
+    url: https://github.com/apple/swift-argument-parser
+    from: "1.3.0"
+
+targets:
+  ClipVault:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: ClipVault
+        excludes:
+          - "**/*Tests*"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.TalkFlow.BrainCache
+        PRODUCT_NAME: BrainCache
+        PRODUCT_MODULE_NAME: ClipVault
+        INFOPLIST_FILE: ClipVault/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ClipVault/Resources/ClipVault.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+    dependencies:
+      - package: GRDB
+        product: GRDB
+      - package: HotKey
+        product: HotKey
+      - package: Sparkle
+        product: Sparkle
+      - target: BrainCacheCLI
+        # Keep this dependency for build ordering only. The auto-embed would
+        # drop the CLI into Resources via a Copy Files build phase, which
+        # collides with our explicit postBuildScript below.
+        embed: false
+        link: false
+    postBuildScripts:
+      - name: Embed braincache CLI binary
+        # The CLI is a separate `tool` target built into BUILT_PRODUCTS_DIR.
+        # We embed it inside the .app bundle's Resources folder so end users
+        # get the CLI at /Applications/BrainCache.app/Contents/Resources/braincache.
+        # Sparkle ships an updated CLI with every app update.
+        #
+        # IMPORTANT: we deliberately do NOT copy into Contents/MacOS. On
+        # case-insensitive APFS (the macOS default), the lowercase filename
+        # "braincache" collides with the main app binary "BrainCache" — the
+        # second file would silently overwrite the first.
+        script: |
+          set -e
+          SRC="${BUILT_PRODUCTS_DIR}/braincache"
+          DST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/braincache"
+          if [ ! -f "$SRC" ]; then
+            echo "warning: braincache CLI binary missing at $SRC; skipping embed"
+            exit 0
+          fi
+          mkdir -p "$(dirname "$DST")"
+          /bin/cp -f "$SRC" "$DST"
+          # Re-sign with the app's identity so the embedded binary is part of
+          # the notarized bundle.
+          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ]; then
+            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --options runtime --timestamp=none "$DST" || true
+          fi
+        inputFiles:
+          - "${BUILT_PRODUCTS_DIR}/braincache"
+        outputFiles:
+          - "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/braincache"
+        basedOnDependencyAnalysis: true
+
+  BrainCacheCLI:
+    type: tool
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: BrainCacheCLI
+    settings:
+      base:
+        PRODUCT_NAME: braincache
+        PRODUCT_MODULE_NAME: BrainCacheCLI
+        # Tool targets in this project share the app's hardened-runtime setup so
+        # Sparkle update notarization covers the embedded CLI too.
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+        # No entitlements file: the CLI is not sandboxed (matches the app) and
+        # needs no extra capabilities — network and Keychain access are allowed
+        # for unsandboxed binaries running as the user.
+        SKIP_INSTALL: YES
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+    dependencies:
+      - package: GRDB
+        product: GRDB
+      - package: ArgumentParser
+        product: ArgumentParser
+
+  ClipVaultTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: ClipVaultTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.TalkFlow.BrainCacheTests
+        INFOPLIST_FILE: ClipVaultTests/Info.plist
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/BrainCache.app/Contents/MacOS/BrainCache"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: ClipVault
+      - package: GRDB
+        product: GRDB

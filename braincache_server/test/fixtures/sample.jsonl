@@ -1,0 +1,7 @@
+{"appName":"Google Chrome","bundleID":"com.google.Chrome","eventType":"session_started","id":"e1","timestamp":"2026-06-04T11:50:58.608Z","windowTitle":""}
+{"appName":"Cursor","bundleID":"com.todesktop.cursor","eventType":"app_activated","id":"e2","timestamp":"2026-06-04T11:51:04.718Z","windowTitle":"linkedin_job_scraper.py — jobspy"}
+{"appName":"Cursor","bundleID":"com.todesktop.cursor","eventType":"left_click","id":"e3","nearbyText":"localhost: 3080","timestamp":"2026-06-04T11:51:05.331Z","windowTitle":"linkedin_job_scraper.py — jobspy","clickX":681.2,"clickY":845.6}
+{"appName":"Google Chrome","bundleID":"com.google.Chrome","eventType":"app_activated","id":"e4","timestamp":"2026-06-04T11:52:00.000Z","windowTitle":"LinkedIn Jobs","url":"https://www.linkedin.com/jobs/"}
+{"appName":"Google Chrome","bundleID":"com.google.Chrome","eventType":"left_click","id":"e5","timestamp":"2026-06-04T11:52:10.000Z","windowTitle":"LinkedIn Jobs","nearbyText":"Search jobs","url":"https://www.linkedin.com/jobs/","screenshotPath":"2026-06-04/shot.jpg"}
+{"appName":"Google Chrome","bundleID":"com.google.Chrome","eventType":"app_activated","id":"e6","timestamp":"2026-06-04T12:20:00.000Z","windowTitle":"OpenAI Docs","url":"https://platform.openai.com/docs"}
+{"appName":"Google Chrome","bundleID":"com.google.Chrome","eventType":"left_click","id":"e7","timestamp":"2026-06-04T12:20:10.000Z","windowTitle":"OpenAI Docs","nearbyText":"API reference","url":"https://platform.openai.com/docs"}
