@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
+import os from "node:os";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,13 +13,15 @@ import {
   chatWithAgentStream
 } from "./agentAnalyzer.js";
 import * as projects from "./projectStore.js";
+import { getProviderConfig } from "./aiProvider.js";
+import { findRecordingFiles, transcribeRecording, transcriptExists, transcriptPathForRecording } from "./transcription.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const PUBLIC = path.join(ROOT, "public");
 const PORT = Number(process.env.PORT || 8787);
 
-// Load the repo-root .env so OPENAI_API_KEY is picked up without extra flags.
+// Load the repo-root .env so NEBIUS_API_KEY is picked up without extra flags.
 for (const candidate of [path.join(ROOT, ".env"), path.resolve(ROOT, "..", ".env")]) {
   try {
     process.loadEnvFile?.(candidate);
@@ -27,18 +30,24 @@ for (const candidate of [path.join(ROOT, ".env"), path.resolve(ROOT, "..", ".env
   }
 }
 
-const DEFAULT_ACTIVITY_ROOT = process.env.BRAINCACHE_ACTIVITY_ROOT || "/Users/bespaloff/Documents/LogsActivity";
+// Where Activity Capture writes logs/, screenshots/, transcripts/ and
+// recordings/. Override with BRAINCACHE_ACTIVITY_ROOT, or per project in the UI.
+const DEFAULT_ACTIVITY_ROOT =
+  process.env.BRAINCACHE_ACTIVITY_ROOT || path.join(os.homedir(), "Documents", "LogsActivity");
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     if (req.method === "GET" && url.pathname === "/api/health") {
+      const config = getProviderConfig();
       return sendJson(res, {
         ok: true,
         defaultActivityRoot: DEFAULT_ACTIVITY_ROOT,
-        aiEnabled: Boolean(process.env.OPENAI_API_KEY),
-        model: process.env.OPENAI_MODEL || "gpt-5.5"
+        aiEnabled: config.enabled,
+        provider: config.providerLabel,
+        model: config.models.agent,
+        models: config.models
       });
     }
 
@@ -132,7 +141,7 @@ const server = http.createServer(async (req, res) => {
               events: dataset.events,
               summary: dataset.summary,
               activityRoot: project.activityRoot || DEFAULT_ACTIVITY_ROOT,
-              model: body.model || process.env.OPENAI_MODEL,
+              model: body.model,
               targetGoals: project.targetGoals || []
             },
             emit
@@ -163,7 +172,7 @@ const server = http.createServer(async (req, res) => {
             {
               events: dataset.events,
               activityRoot: project.activityRoot || DEFAULT_ACTIVITY_ROOT,
-              model: body.model || process.env.OPENAI_MODEL,
+              model: body.model,
               history,
               message,
               analysis: project.analysis
@@ -178,6 +187,84 @@ const server = http.createServer(async (req, res) => {
           await emit({ type: "saved", project: saved });
         } catch (error) {
           await emit({ type: "error", message: error.message });
+        } finally {
+          res.end();
+        }
+        return;
+      }
+
+      // Meeting recordings under <activityRoot>/recordings/, with whether each
+      // one already has a transcript next to it.
+      if (sub === "/recordings" && req.method === "GET") {
+        const project = await projects.getProject(projectId);
+        const activityRoot = project.activityRoot || DEFAULT_ACTIVITY_ROOT;
+        const files = await findRecordingFiles(activityRoot);
+        const recordings = await Promise.all(files.map(async (file) => ({
+          ...file,
+          transcriptPath: transcriptPathForRecording(file.path),
+          hasTranscript: await transcriptExists(activityRoot, file.path)
+        })));
+        return sendJson(res, { activityRoot, recordings });
+      }
+
+      // Transcribe recordings with the omni model, streaming progress. By
+      // default only the ones that have no transcript yet; pass `paths` to pick
+      // specific recordings, or `force: true` to redo everything.
+      if (sub === "/transcribe" && req.method === "POST") {
+        const body = await readJson(req).catch(() => ({}));
+        const project = await projects.getProject(projectId);
+        const activityRoot = project.activityRoot || DEFAULT_ACTIVITY_ROOT;
+        const config = getProviderConfig();
+        const requested = Array.isArray(body.paths) && body.paths.length ? new Set(body.paths.map(String)) : null;
+        const emit = openEventStream(res);
+        try {
+          if (!config.enabled) {
+            throw new Error("Transcription needs a Nebius Token Factory key. Set NEBIUS_API_KEY on the server.");
+          }
+          const all = await findRecordingFiles(activityRoot);
+          const pending = [];
+          let skipped = 0;
+          for (const file of all) {
+            if (requested && !requested.has(file.path)) continue;
+            if (!body.force && await transcriptExists(activityRoot, file.path)) { skipped += 1; continue; }
+            pending.push(file);
+          }
+          if (!pending.length) {
+            await emit({ type: "thinking", message: skipped ? `All ${skipped} recording(s) are already transcribed.` : "No recordings found under this project's activity root." });
+            await emit({ type: "done", transcribed: 0, skipped, failed: 0 });
+          } else {
+            await emit({ type: "thinking", message: `Transcribing ${pending.length} recording(s) with ${config.models.omni}.` });
+            let transcribed = 0;
+            let failed = 0;
+            for (const [index, file] of pending.entries()) {
+              await emit({ type: "thinking", message: `(${index + 1}/${pending.length}) ${file.path}` });
+              const filePath = resolveMediaPath(activityRoot, "recordings", file.path);
+              if (!filePath) {
+                failed += 1;
+                await emit({ type: "error", message: `Invalid recording path: ${file.path}` });
+                continue;
+              }
+              try {
+                const result = await transcribeRecording(filePath, { emit, activityRoot, relativePath: file.path, config });
+                transcribed += 1;
+                await emit({
+                  type: "transcribed",
+                  path: file.path,
+                  transcriptPath: result.transcriptPath,
+                  seconds: result.seconds,
+                  chars: result.text.length,
+                  model: result.model
+                });
+              } catch (error) {
+                failed += 1;
+                await emit({ type: "error", message: `${file.path}: ${error.message}` });
+              }
+            }
+            await emit({ type: "done", transcribed, skipped, failed });
+          }
+        } catch (error) {
+          await emit({ type: "error", message: error.message });
+          await emit({ type: "done", transcribed: 0, skipped: 0, failed: 0 });
         } finally {
           res.end();
         }
@@ -212,7 +299,7 @@ const server = http.createServer(async (req, res) => {
               goal: { title: goal.title, summary: goal.summary },
               events: dataset.events,
               activityRoot: project.activityRoot || DEFAULT_ACTIVITY_ROOT,
-              model: body.model || process.env.OPENAI_MODEL
+              model: body.model
             },
             emit
           );
@@ -264,7 +351,7 @@ const server = http.createServer(async (req, res) => {
               goal: goal ? { title: goal.title, summary: goal.summary } : null,
               events: dataset.events,
               activityRoot: project.activityRoot || DEFAULT_ACTIVITY_ROOT,
-              model: body.model || process.env.OPENAI_MODEL
+              model: body.model
             },
             emit
           );
@@ -327,7 +414,7 @@ const server = http.createServer(async (req, res) => {
       const events = Array.isArray(body.events) ? body.events : [];
       const summary = body.summary || {};
       const activityRoot = body.activityRoot || DEFAULT_ACTIVITY_ROOT;
-      const model = body.model || process.env.OPENAI_MODEL || "gpt-5.5";
+      const model = body.model;
       const emit = openEventStream(res);
       try {
         await analyzeActivityWithAgentStream({ events, summary, activityRoot, model }, emit);

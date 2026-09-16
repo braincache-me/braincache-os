@@ -55,7 +55,7 @@ function emitPart(part, onEvent) {
 // ===========================================================================
 
 function App() {
-  const [health, setHealth] = useState({ aiEnabled: false, model: "gpt-5.5", defaultActivityRoot: "" });
+  const [health, setHealth] = useState({ aiEnabled: false, model: "", provider: "", defaultActivityRoot: "" });
   const [projects, setProjects] = useState([]);
   const [project, setProject] = useState(null);
   const [loadingProject, setLoadingProject] = useState(false);
@@ -172,7 +172,7 @@ function Sidebar({ health, projects, activeId, onSelect, onCreate, onDelete }) {
     ),
     h("div", { className: "sidebar-footer" },
       h("span", { className: `dot ${health.aiEnabled ? "ok" : "off"}` }),
-      health.aiEnabled ? `AI ready · ${health.model}` : "AI key not set"
+      health.aiEnabled ? `AI ready · ${shortModel(health.model)}` : "AI key not set"
     )
   );
 }
@@ -304,7 +304,7 @@ function ProjectView({ project, setProject, onChanged, health }) {
     setBusy(true);
     setActiveTab("agent");
     try {
-      await streamPost(`/api/projects/${project.id}/initialize`, { model: health.model }, (event) => {
+      await streamPost(`/api/projects/${project.id}/initialize`, {}, (event) => {
         setStream((current) => [...current, event]);
         if (event.type === "saved" && event.project) {
           setProject(event.project);
@@ -345,7 +345,10 @@ function ProjectView({ project, setProject, onChanged, health }) {
     ),
     h("div", { className: "project-body" },
       activeTab === "logs"
-        ? h(SourcesPanel, { project, busy, onAddFiles: addFiles, onAddPaths: addByPaths, onAddDirectory: addDirectory, onRemove: removeFile, onInitialize: initialize, onSaveGoals: saveGoals, aiEnabled: health.aiEnabled })
+        ? h(React.Fragment, null,
+            h(SourcesPanel, { project, busy, onAddFiles: addFiles, onAddPaths: addByPaths, onAddDirectory: addDirectory, onRemove: removeFile, onInitialize: initialize, onSaveGoals: saveGoals, aiEnabled: health.aiEnabled }),
+            h(RecordingsPanel, { project, aiEnabled: health.aiEnabled, omniModel: health.models?.omni })
+          )
         : null,
       activeTab === "agent"
         ? ((stream.length || project.lastRun?.trace?.length)
@@ -485,8 +488,87 @@ function SourcesPanel({ project, busy, onAddFiles, onAddPaths, onAddDirectory, o
           disabled: busy || !project.files.length,
           onClick: async () => { await saveGoals(); onInitialize(); }
         }, busy ? "Working…" : analyzed ? "Re-analyze project" : "Initialize project →"),
-        !aiEnabled ? h("span", { className: "hint" }, "Set OPENAI_API_KEY for AI analysis (built-in analyzer used otherwise).") : null
+        !aiEnabled ? h("span", { className: "hint" }, "Set NEBIUS_API_KEY for Nemotron analysis (built-in analyzer used otherwise).") : null
       )
+    )
+  );
+}
+
+// ===========================================================================
+// Recordings — transcribe meeting audio with the omni model
+// ===========================================================================
+
+function RecordingsPanel({ project, aiEnabled, omniModel }) {
+  const [recordings, setRecordings] = useState(null);
+  const [error, setError] = useState("");
+  const [stream, setStream] = useState([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { refresh(); }, [project.id]);
+
+  async function refresh() {
+    try {
+      const data = await api(`/api/projects/${project.id}/recordings`);
+      setRecordings(data.recordings || []);
+      setError("");
+    } catch (err) {
+      setRecordings([]);
+      setError(err.message);
+    }
+  }
+
+  async function transcribe(paths) {
+    setBusy(true);
+    setStream([]);
+    try {
+      await streamPost(`/api/projects/${project.id}/transcribe`, paths ? { paths } : {}, (event) => {
+        setStream((current) => [...current, event]);
+      });
+      await refresh();
+    } catch (err) {
+      setStream((current) => [...current, { type: "error", message: err.message }]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const list = recordings || [];
+  const pending = list.filter((item) => !item.hasTranscript);
+
+  return h("section", { className: "card sources" },
+    h("div", { className: "card-head" },
+      h("h2", null, "Meeting recordings"),
+      h("button", { className: "link-btn", disabled: busy, onClick: refresh }, "Refresh")
+    ),
+    h("div", { className: "card-body" },
+      error ? h("div", { className: "banner error" }, error) : null,
+      recordings === null
+        ? h("div", { className: "hint" }, "Looking for recordings…")
+        : list.length
+          ? h("ul", { className: "file-list" },
+              list.map((item) => h("li", { key: item.path, className: "file-row" },
+                h("div", { className: "file-info" },
+                  h("span", { className: "file-name" }, item.path),
+                  h("span", { className: "file-meta" }, `${formatBytes(item.size)}${item.hasTranscript ? ` · ${item.transcriptPath}` : ""}`)
+                ),
+                h("span", { className: `pill ${item.hasTranscript ? "green" : "muted"}` }, item.hasTranscript ? "transcript ready" : "no transcript"),
+                item.hasTranscript
+                  ? null
+                  : h("button", { className: "btn sm", disabled: busy || !aiEnabled, onClick: () => transcribe([item.path]) }, "Transcribe")
+              ))
+            )
+          : h("div", { className: "hint" }, `No recordings found under ${project.activityRoot || "the activity root"}/recordings.`),
+      h("div", { className: "sources-actions" },
+        h("button", {
+          className: "btn primary",
+          disabled: busy || !aiEnabled || !pending.length,
+          onClick: () => transcribe(null)
+        }, busy ? "Transcribing…" : `Transcribe recordings (Nemotron Omni)${pending.length ? ` · ${pending.length}` : ""}`),
+        !aiEnabled
+          ? h("span", { className: "hint" }, "Set NEBIUS_API_KEY to transcribe with the omni model.")
+          : h("span", { className: "hint" }, `Audio goes to ${shortModel(omniModel) || "the omni model"} in ≤10-minute chunks; transcripts land next to the logs so the agent can quote them.`)
+      ),
+      stream.length ? h(AgentStream, { events: stream, title: busy ? "Transcribing" : "Last transcription run", embedded: true }) : null
     )
   );
 }
@@ -606,7 +688,7 @@ function GoalDetail({ project, goal, tasks, sortDir, onSelectTask, setProject, o
     setSkillStream([]);
     setTab("skill");
     try {
-      await streamPost(`/api/projects/${project.id}/goals/${goal.id}/skill`, { model: health.model }, (event) => {
+      await streamPost(`/api/projects/${project.id}/goals/${goal.id}/skill`, {}, (event) => {
         setSkillStream((current) => [...current, event]);
         if (event.type === "saved" && event.project) { setProject(event.project); onChanged(); }
       });
@@ -696,6 +778,13 @@ function Overview({ analysis, performance, goals = [], tasks = [] }) {
     h("div", { className: "card-body stack" },
       analysis.warning ? h("div", { className: "banner warn" }, "⚠︎ " + analysis.warning + " Re-analyze to retry the AI analysis.") : null,
       h("p", { className: "overview-text" }, analysis.overview || performance.summary || "Analysis complete."),
+      analysis.models ? h("div", { className: "goal-chips" },
+        h("span", { className: "goal-chips-label" }, "Models:"),
+        h("span", { className: "goal-chip", title: analysis.models.agent }, "analysis · ", shortModel(analysis.models.agent)),
+        analysis.models.reasoning
+          ? h("span", { className: "goal-chip", title: analysis.models.reasoning }, "goals · ", shortModel(analysis.models.reasoning))
+          : null
+      ) : null,
       goals.length ? h("div", { className: "goal-chips" },
         h("span", { className: "goal-chips-label" }, "Goals:"),
         goals.map((goal) => h("span", { key: goal.id, className: "goal-chip" },
@@ -1248,7 +1337,7 @@ function SkillView({ savedSkill, stream, generating, emptyText, onCopy, onDownlo
             )
           : h(React.Fragment, null,
               h("div", { className: "skill-actions" },
-                h("span", { className: `pill ${savedSkill.source === "openai" ? "green" : "muted"}` }, savedSkill.source === "openai" ? `AI · ${savedSkill.model || ""}` : "template"),
+                h("span", { className: `pill ${savedSkill.source === "template" ? "muted" : "green"}` }, savedSkill.source === "template" ? "template" : `AI · ${shortModel(savedSkill.model)}`),
                 savedSkill.editedAt ? h("span", { className: "edited-tag" }, "edited") : null,
                 h("button", { className: "btn sm", onClick: startEdit }, "Edit"),
                 h("button", { className: "btn sm", onClick: onCopy }, "Copy"),
@@ -1280,7 +1369,7 @@ function ChatPanel({ project, setProject, onChanged, health }) {
     setBusy(true);
     setPending({ question: text, stream: [] });
     try {
-      await streamPost(`/api/projects/${project.id}/chat`, { message: text, model: health.model }, (event) => {
+      await streamPost(`/api/projects/${project.id}/chat`, { message: text }, (event) => {
         if (event.type === "saved" && event.project) {
           setProject(event.project);
           onChanged();
@@ -1321,7 +1410,7 @@ function ChatPanel({ project, setProject, onChanged, health }) {
       h("textarea", {
         value: draft,
         rows: 1,
-        placeholder: health.aiEnabled ? "Ask a question…" : "Set OPENAI_API_KEY to chat",
+        placeholder: health.aiEnabled ? "Ask a question…" : "Set NEBIUS_API_KEY to chat",
         disabled: !health.aiEnabled,
         onChange: (event) => setDraft(event.target.value),
         onKeyDown: (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }
@@ -1461,6 +1550,7 @@ function StreamItem({ event }) {
     tool_call: { icon: "→", cls: "call", text: `${friendlyToolName(event.name)}${argHint(event.arguments)}` },
     tool_output: { icon: "←", cls: "out", text: `${friendlyToolName(event.name)} responded` },
     output: { icon: "✓", cls: "done", text: "Agent drafted its answer" },
+    transcribed: { icon: "♪", cls: "done", text: `Transcribed ${event.path || ""}${event.seconds ? ` (${formatDuration(event.seconds / 60)} of audio)` : ""}` },
     saved: { icon: "✓", cls: "done", text: "Saved to project" },
     done: { icon: "✓", cls: "done", text: "Done" },
     error: { icon: "!", cls: "err", text: event.message }
@@ -1477,7 +1567,8 @@ function friendlyToolName(name) {
     search_events: "Searching the activity",
     get_event_detail: "Looking at one event closely",
     inspect_screenshot: "Looking at a screenshot",
-    read_transcript: "Reading a transcript"
+    read_transcript: "Reading a transcript",
+    transcribe_recording: "Transcribing a recording"
   }[name] || name;
 }
 
@@ -1504,6 +1595,11 @@ function stepAsEvent(step) {
 
 function basename(value) {
   return String(value || "").split("/").pop();
+}
+
+// "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B" → "NVIDIA-Nemotron-3-Nano-30B-A3B".
+function shortModel(value) {
+  return basename(value);
 }
 
 function formatBytes(bytes) {

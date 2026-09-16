@@ -1,20 +1,33 @@
+// The analysis agent — reads recorded activity through tool calls and returns
+// business-outcome tasks, a goal grouping, reusable skills, and chat answers.
+//
+// Transport is the OpenAI-compatible Chat Completions API (Nebius Token Factory
+// by default, see aiProvider.js). Model routing:
+//   agent     — the tool-calling analysis loop and skill authoring
+//   reasoning — one extra non-tool pass that groups tasks into business goals
+//   fast      — conversational follow-ups in the Chat tab
+//   omni      — screenshot vision and meeting-recording transcription
+//
+// Without a key every path degrades to the deterministic built-in analyzer /
+// skill template, so the console still works offline.
+
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveMediaPath } from "./activityParser.js";
 import { eventLabel, inferTasks, computeTaskMetrics } from "./taskInference.js";
 import { generateSkillMarkdown } from "./skillGenerator.js";
+import {
+  chatCompletion,
+  getProviderConfig,
+  messageText,
+  messageToolCalls,
+  omniChatCompletion,
+  stripThinkTags
+} from "./aiProvider.js";
+import { transcribeRecording, transcriptExists, transcriptPathForRecording } from "./transcription.js";
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
-// A real agentic loop needs room to look around. These are generous but bounded.
-const MAX_TOOL_ROUNDS = Number(process.env.OPENAI_MAX_TOOL_ROUNDS || 8);
-const MAX_TOOL_CALLS = Number(process.env.OPENAI_MAX_TOOL_CALLS || 14);
-// Reasoning models with tool use + vision routinely take longer than a few
-// seconds. The old 12s default aborted screenshot inspection mid-flight.
-const REQUEST_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 240000);
-// Final analysis JSON for a busy day can be large. 8000 truncated it and the
-// unparseable JSON silently fell back to the app-centric heuristic analyzer.
-const MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 24000);
+export const NO_KEY_MESSAGE = "AI analysis needs a Nebius Token Factory key. Set NEBIUS_API_KEY on the server.";
+const NO_KEY_CHAT_MESSAGE = "AI chat needs a Nebius Token Factory key. Set NEBIUS_API_KEY on the server to ask questions about your logs.";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -24,63 +37,36 @@ export async function analyzeActivityWithAgent(input) {
   return analyzeActivityWithAgentStream(input, async () => {});
 }
 
-export async function analyzeActivityWithAgentStream({ events, summary, activityRoot, model = DEFAULT_MODEL, targetGoals = [] }, emit) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    await emit({ type: "thinking", message: "No OpenAI key is set — using the built-in analyzer instead." });
-    const fallback = heuristicAnalysis(events, summary, "OpenAI key is not set; used the built-in analyzer.", targetGoals);
+export async function analyzeActivityWithAgentStream(
+  { events, summary, activityRoot, model, targetGoals = [], config = getProviderConfig() },
+  emit
+) {
+  if (!config.enabled) {
+    await emit({ type: "thinking", message: "No Nebius Token Factory key is set — using the built-in analyzer instead." });
+    const fallback = heuristicAnalysis(events, summary, `${NO_KEY_MESSAGE} Used the built-in analyzer.`, targetGoals);
     await emit({ type: "done", analysis: fallback });
     return fallback;
   }
 
+  const agentModel = model || config.models.agent;
   const compactSummary = buildCompactSummary(events, summary);
-  const toolContext = { events, activityRoot, apiKey, model };
+  const toolContext = { events, activityRoot, config, emit };
 
   await emit({
     type: "thinking",
     message: `Reading ${compactSummary.eventCount} recorded events` +
       `${compactSummary.screenshotCount ? `, ${compactSummary.screenshotCount} screenshots` : ""}` +
-      `${compactSummary.transcriptCount ? `, ${compactSummary.transcriptCount} transcripts` : ""}.`
+      `${compactSummary.transcriptCount ? `, ${compactSummary.transcriptCount} transcripts` : ""}` +
+      ` with ${agentModel}.`
   });
 
   try {
-    const userContent = [
-      {
-        type: "input_text",
-        text: [
-          "Analyze these recorded computer-activity logs and figure out the BUSINESS PROBLEMS the person was solving — not which apps they used.",
-          "Use the tools to read across the WHOLE event set, search for evidence, inspect screenshots, and read transcripts where helpful. Don't judge from the first events alone — survey the timeline.",
-          "Method: (1) read the events; (2) for each action ask WHY it happened — which business process drove it (e.g. a meeting attended because of the monthly accounting close, or because of product work) — the 'why' is the goal, not the surface; (3) CONNECT events that belong together — even when they jump between different apps and are separated by time — because they serve one real-world outcome; (4) build the CHRONOLOGY of connected events that achieved each outcome; (5) GROUP by the business target/outcome; (6) only then produce the analysis.",
-          "Apps (SAP, a web browser, Excel, email, Slack, a terminal…) are just TOOLS, never the goal. Do NOT create goals like 'Google Chrome', 'SAP GUI', 'Research & browsing', or 'Writing & communication'. Those describe the tool or the verb, not the business problem — name the outcome instead.",
-          "Example: actions in SAP, then a browser, then Excel, then email might all be ONE goal: 'Book incoming invoices correctly' — the apps are incidental. Group them together. Likewise reading Bloomberg + checking email + a calendar might all serve 'Prepare for the investment review meeting'.",
-          targetGoals.length
-            ? [
-                "The user has DEFINED the business goals they care about. Organize the activity into THESE goals, using them as the goal titles (refine wording only slightly):",
-                ...targetGoals.map((goal, index) => `  ${index + 1}. ${goal}`),
-                "For each defined goal, find the connected events across apps and build the chronology that advanced it. Put activity that fits no defined goal under a final goal titled 'Other activity'. If a defined goal has no supporting activity, omit it and say so in the overview."
-              ].join("\n")
-            : "Infer the goals yourself from the evidence.",
-          "Three levels: GOAL = the business problem/outcome (cross-app); TASK = an end-to-end workflow that advances the goal (may span several apps); STEP = the concrete actions in chronological order.",
-          "Write everything for a non-technical reader: plain language, no CSS selectors, no raw event-type names.",
-          "Return final output as JSON only, with this exact top-level shape:",
-          "{ overview: string, performance: { summary: string, strengths: string[], bottlenecks: string[], recommendations: string[] }, goals: Goal[], tasks: Task[] }.",
-          "Each Goal: { id, title (the business outcome in plain language, e.g. 'Book incoming invoices correctly'), summary (the problem being solved and the apps it spanned), taskIds: string[] }.",
-          "Each Task: { id, title, summary, goalId, startTimestamp, endTimestamp, confidence (0-1), attempts (integer), outcome ('completed'|'incomplete'|'partial'), eventIds: string[] (a REPRESENTATIVE subset — the key evidence, not every event), steps: Step[] (milestones, not every click; cap ~12), performance: { timeSpent: string, friction: string[], automatable: boolean } }.",
-          "Each Step: { label (plain-language, e.g. 'Entered the invoice in SAP'), evidenceEventId, appName, timestamp, notes }.",
-          "Every task belongs to exactly one goal. Keep goals few and outcome-based (usually 2-6). Be concise so the JSON is complete and valid.",
-          "",
-          `Dataset summary: ${JSON.stringify(compactSummary)}.`,
-          `First events preview: ${JSON.stringify(events.slice(0, 18).map(compactEvent))}.`
-        ].join("\n")
-      }
-    ];
-
     const finalText = await runAgentLoop({
-      apiKey,
-      model,
+      config,
+      model: agentModel,
       toolContext,
       systemPrompt: analysisSystemPrompt(),
-      userContent,
+      messages: [{ role: "user", content: analysisUserPrompt({ compactSummary, events, targetGoals }) }],
       emit
     });
 
@@ -88,17 +74,34 @@ export async function analyzeActivityWithAgentStream({ events, summary, activity
     const parsed = parseJsonObject(finalText);
     if (!parsed?.tasks) {
       await emit({ type: "thinking", message: "The agent's answer wasn't usable — falling back to the built-in analyzer." });
-      const fallback = heuristicAnalysis(events, summary, "OpenAI response was not valid analysis JSON; used the built-in analyzer.", targetGoals);
+      const fallback = heuristicAnalysis(events, summary, "The model's response was not valid analysis JSON; used the built-in analyzer.", targetGoals);
       await emit({ type: "done", analysis: fallback });
       return fallback;
     }
 
-    const analysis = normalizeAgentAnalysis(parsed, events, model);
+    const tasks = normalizeAgentTasks(parsed, events);
+    const grouping = await planGoals({ tasks, targetGoals, rawGoals: parsed.goals, config, emit });
+    // The reasoning pass re-groups from scratch — drop the analysis model's own
+    // goalIds so its ids can't pull tasks into a same-named reasoning goal.
+    if (grouping.source === "reasoning") tasks.forEach((task) => { delete task.goalId; });
+
+    const analysis = {
+      source: "ai",
+      provider: config.providerLabel,
+      model: agentModel,
+      models: { agent: agentModel, reasoning: config.models.reasoning },
+      overview: parsed.overview || "",
+      performance: parsed.performance || {},
+      goals: buildGoals(grouping.rawGoals, tasks),
+      tasks
+    };
+    if (grouping.warning) analysis.warning = grouping.warning;
+
     await emit({ type: "done", analysis });
     return analysis;
   } catch (error) {
     await emit({ type: "error", message: error.message });
-    const fallback = heuristicAnalysis(events, summary, `OpenAI analysis failed: ${error.message}; used the built-in analyzer.`, targetGoals);
+    const fallback = heuristicAnalysis(events, summary, `AI analysis failed: ${error.message}; used the built-in analyzer.`, targetGoals);
     await emit({ type: "done", analysis: fallback });
     return fallback;
   }
@@ -111,60 +114,29 @@ export async function generateSkillWithAgent(input) {
 // Agentic skill authoring: the model inspects the task's evidence through the
 // same tools and writes a ready-to-use SKILL.md. Falls back to the deterministic
 // template when no key is set or the model misbehaves.
-export async function generateSkillWithAgentStream({ task, events, activityRoot, model = DEFAULT_MODEL, goal }, emit) {
-  const apiKey = process.env.OPENAI_API_KEY;
+export async function generateSkillWithAgentStream(
+  { task, events, activityRoot, model, goal, config = getProviderConfig() },
+  emit
+) {
   const taskEvents = scopeEventsToTask(task, events);
 
-  if (!apiKey) {
-    await emit({ type: "thinking", message: "No OpenAI key is set — generating a skill from the built-in template." });
+  if (!config.enabled) {
+    await emit({ type: "thinking", message: "No Nebius Token Factory key is set — generating a skill from the built-in template." });
     const markdown = generateSkillMarkdown(task);
     await emit({ type: "done", skill: { markdown, source: "template" } });
     return { markdown, source: "template" };
   }
 
+  const agentModel = model || config.models.agent;
   await emit({ type: "thinking", message: `Generalizing “${task.title}” into a reusable skill from ${taskEvents.length} steps of evidence.` });
 
   try {
-    const userContent = [
-      {
-        type: "input_text",
-        text: [
-          "Write a reusable agent SKILL.md that GENERALIZES this observed workflow so an AI agent can complete SIMILAR cases in the future — not replay this one exact instance.",
-          `Observed task: "${task.title}".`,
-          `Task summary: ${task.summary || "(none)"}.`,
-          goal?.title ? `Business goal this serves: "${goal.title}"${goal.summary ? ` — ${goal.summary}` : ""}.` : "",
-          "Inspect the evidence with the tools (events, screenshots, transcripts) before writing, so the procedure is accurate.",
-          "",
-          "ABSTRACTION RULES (critical):",
-          "- Generalize to the CLASS of task. The skill title and steps should fit any similar case, e.g. 'Book a supplier invoice in SAP', NOT 'Book Acme invoice INV-2026-4471'.",
-          "- Replace every case-specific value (invoice numbers, vendor names, amounts, PO numbers, dates, person names, file names) with a NAMED PLACEHOLDER like {invoice_number}, {vendor}, {po_number}.",
-          "- For EVERY placeholder, say WHERE to find it: which app, screen, document, or field to read it from (e.g. '{po_number} — on the invoice PDF header, or matched in SAP ME23N').",
-          "- Capture decision points and branches you saw (e.g. 'if approval is rejected for wrong coding, correct the account assignment and repost') as general conditional steps.",
-          "- Mention the specific observed case ONLY as a short example, clearly labelled.",
-          "",
-          "The skill must be practical for an AI agent that can drive a Mac (browser + native apps). Use stable anchors (visible text, menu paths, transaction codes, URLs, accessibility labels, file paths) — never raw click coordinates. Never include secure or private values.",
-          "Return ONLY GitHub-flavored Markdown (no JSON, no code fences around the whole document) with these sections:",
-          "# <Generalized title — the class of task>",
-          "## Purpose — when to use this skill and which business goal it accomplishes (generalized).",
-          "## Inputs — for each variable the agent needs, a line: `{placeholder}` — what it is, and **where to find it** (app/screen/document/field).",
-          "## Required Access — apps, sites, systems, permissions.",
-          "## Procedure — numbered general steps with the app and the anchor to act on; include the conditional branches observed.",
-          "## Where to find details — a checklist mapping each piece of needed information to the source/system and how to locate it.",
-          "## Verification — how the agent confirms the goal was achieved.",
-          "## Notes & Risks — privacy, approval gates, edge cases. Reference the observed case only as an illustrative example.",
-          "",
-          `Observed steps (evidence to generalize, not to copy verbatim): ${JSON.stringify((task.steps || []).slice(0, 24))}.`,
-          `Apps involved: ${(task.apps || []).map((app) => app.name).join(", ") || "unknown"}.`
-        ].filter(Boolean).join("\n")
-      }
-    ];
-
     const markdown = await runAgentLoop({
-      apiKey,
-      model,
-      toolContext: { events: taskEvents, activityRoot, apiKey, model },
+      config,
+      model: agentModel,
+      toolContext: { events: taskEvents, activityRoot, config, emit },
       systemPrompt: skillSystemPrompt(),
-      userContent,
+      messages: [{ role: "user", content: skillUserPrompt({ task, goal }) }],
       emit,
       maxRounds: 5,
       maxCalls: 8
@@ -178,8 +150,9 @@ export async function generateSkillWithAgentStream({ task, events, activityRoot,
       return { markdown: fallback, source: "template" };
     }
 
-    await emit({ type: "done", skill: { markdown: trimmed, source: "openai", model } });
-    return { markdown: trimmed, source: "openai", model };
+    const skill = { markdown: trimmed, source: "ai", model: agentModel };
+    await emit({ type: "done", skill });
+    return skill;
   } catch (error) {
     await emit({ type: "error", message: error.message });
     const fallback = generateSkillMarkdown(task);
@@ -190,31 +163,26 @@ export async function generateSkillWithAgentStream({ task, events, activityRoot,
 
 // Conversational follow-up: ask questions about the logs and the extracted
 // tasks. Keeps prior turns as context so follow-ups work, and uses the same
-// tools to look up real evidence before answering.
-export async function chatWithAgentStream({ events, activityRoot, model = DEFAULT_MODEL, history = [], message, analysis }, emit) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    const answer = "AI chat needs an OpenAI key. Set OPENAI_API_KEY on the server to ask questions about your logs.";
-    await emit({ type: "done", answer });
-    return { answer, toolTrace: [] };
+// tools to look up real evidence before answering. Runs on the fast model.
+export async function chatWithAgentStream(
+  { events, activityRoot, model, history = [], message, analysis, config = getProviderConfig() },
+  emit
+) {
+  if (!config.enabled) {
+    await emit({ type: "done", answer: NO_KEY_CHAT_MESSAGE });
+    return { answer: NO_KEY_CHAT_MESSAGE, toolTrace: [] };
   }
 
   try {
-    const input = [];
-    for (const turn of history.slice(-20)) {
-      const role = turn.role === "assistant" ? "assistant" : "user";
-      input.push({ role, content: [{ type: role === "assistant" ? "output_text" : "input_text", text: String(turn.content || "") }] });
-    }
-    input.push({ role: "user", content: [{ type: "input_text", text: String(message || "") }] });
-
+    const chatModel = model || config.models.fast;
     await emit({ type: "thinking", message: "Looking through the activity to answer…" });
 
     const answer = await runAgentLoop({
-      apiKey,
-      model,
-      toolContext: { events, activityRoot, apiKey, model },
+      config,
+      model: chatModel,
+      toolContext: { events, activityRoot, config, emit },
       systemPrompt: chatSystemPrompt(analysis),
-      inputMessages: input,
+      messages: [...historyMessages(history), { role: "user", content: String(message || "") }],
       emit,
       maxRounds: 6,
       maxCalls: 10
@@ -230,97 +198,153 @@ export async function chatWithAgentStream({ events, activityRoot, model = DEFAUL
   }
 }
 
+// Prior chat turns as plain Chat Completions messages.
+export function historyMessages(history = [], limit = 20) {
+  return history.slice(-limit).map((turn) => ({
+    role: turn.role === "assistant" ? "assistant" : "user",
+    content: String(turn.content || "")
+  }));
+}
+
 // ---------------------------------------------------------------------------
-// Agent driver — one place, used by analysis and skill authoring.
+// Agent driver — one place, used by analysis, skill authoring and chat.
 //
-// Correctness rule for the Responses API: when a response contains
-// `function_call` items and we continue the turn with `previous_response_id`,
-// EVERY function_call must get a matching `function_call_output`. The previous
-// version dropped over-budget calls and, when out of tool budget, sent a bare
-// user message — both leave function calls unanswered, which is exactly the
-// "No tool output found for function call …" error. This driver always answers
-// every call, and forces the final answer with tool_choice:"none" instead of an
-// unmatched user message.
+// Correctness rule for Chat Completions tool use: when a response carries
+// `tool_calls`, the assistant message must be appended verbatim and EVERY call
+// must be answered by exactly one `{role:"tool", tool_call_id}` message —
+// including calls skipped because the budget ran out. When the budget is
+// reached the next request is sent with tool_choice:"none" so the model has to
+// answer in text instead of calling again.
 // ---------------------------------------------------------------------------
 
-async function runAgentLoop({ apiKey, model, toolContext, systemPrompt, userContent, inputMessages, emit, maxRounds = MAX_TOOL_ROUNDS, maxCalls = MAX_TOOL_CALLS }) {
-  const tools = buildTools();
+async function runAgentLoop({ config, model, toolContext, systemPrompt, messages: seed, emit, maxRounds, maxCalls }) {
+  const tools = buildToolDefinitions();
+  const rounds = maxRounds ?? config.limits.maxToolRounds;
+  const callBudget = maxCalls ?? config.limits.maxToolCalls;
+  const messages = [{ role: "system", content: systemPrompt }, ...seed];
 
-  let response = await callResponses(apiKey, {
+  const ask = (toolChoice) => chatCompletion({
     model,
-    reasoning: { effort: "medium" },
-    max_output_tokens: MAX_OUTPUT_TOKENS,
-    instructions: systemPrompt,
-    input: inputMessages || [{ role: "user", content: userContent }],
-    tools
-  });
+    messages,
+    tools,
+    tool_choice: toolChoice,
+    max_tokens: config.limits.maxOutputTokens
+  }, { config });
 
+  let response = await ask("auto");
   let totalCalls = 0;
-  for (let round = 0; round < maxRounds; round += 1) {
-    const calls = getFunctionCalls(response);
+
+  for (let round = 0; round < rounds; round += 1) {
+    const calls = messageToolCalls(response);
     if (!calls.length) break;
 
     await emit({ type: "thinking", message: `Looking deeper (round ${round + 1}): ${calls.length} tool call(s).` });
+    messages.push(assistantTurn(response));
 
-    const outputs = [];
     for (const call of calls) {
-      const args = parseToolArguments(call.arguments);
-      await emit({ type: "tool_call", callId: call.call_id, name: call.name, arguments: args });
+      const name = call.function?.name || call.name;
+      const args = parseToolArguments(call.function?.arguments);
+      await emit({ type: "tool_call", callId: call.id, name, arguments: args });
 
       let result;
-      if (totalCalls >= maxCalls) {
-        result = { error: "Tool budget reached. Do not call more tools — return your final answer now." };
+      if (totalCalls >= callBudget) {
+        result = { error: "Tool budget exhausted. Do not call more tools — return your final answer now." };
       } else {
-        result = await executeToolCall(call, toolContext);
+        result = await executeToolCall(name, args, toolContext);
         totalCalls += 1;
       }
 
-      await emit({ type: "tool_output", callId: call.call_id, name: call.name, output: summarizeToolOutput(result) });
-      // Always answer every call_id, in order.
-      outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result) });
+      await emit({ type: "tool_output", callId: call.id, name, output: summarizeToolOutput(result) });
+      // Every call_id gets exactly one tool message, in order.
+      messages.push(toolResultMessage(call, result));
     }
 
-    const budgetReached = totalCalls >= maxCalls;
+    const budgetReached = totalCalls >= callBudget;
     await emit({
       type: "thinking",
       message: budgetReached ? "Wrapping up — composing the final answer." : "Thinking through the evidence so far."
     });
 
-    response = await callResponses(apiKey, {
-      model,
-      previous_response_id: response.id,
-      reasoning: { effort: budgetReached ? "low" : "medium" },
-      max_output_tokens: MAX_OUTPUT_TOKENS,
-      input: outputs,
-      tools,
-      tool_choice: budgetReached ? "none" : "auto"
-    });
-
+    response = await ask(budgetReached ? "none" : "auto");
     if (budgetReached) break;
   }
 
-  // Safety net: if the model somehow still emitted tool calls, answer them
-  // (never leave them unmatched) and force a text reply.
+  // Safety net: the round budget ran out (or the model ignored tool_choice) and
+  // calls are still pending — answer them, never leave one unmatched, and force
+  // a text reply.
   let guard = 0;
-  while (getFunctionCalls(response).length && guard < 2) {
+  while (messageToolCalls(response).length && guard < 2) {
     guard += 1;
-    const outputs = getFunctionCalls(response).map((call) => ({
-      type: "function_call_output",
-      call_id: call.call_id,
-      output: JSON.stringify({ error: "No more tools available — return your final answer as text now." })
-    }));
-    response = await callResponses(apiKey, {
-      model,
-      previous_response_id: response.id,
-      reasoning: { effort: "low" },
-      max_output_tokens: MAX_OUTPUT_TOKENS,
-      input: outputs,
-      tools,
-      tool_choice: "none"
-    });
+    messages.push(assistantTurn(response));
+    for (const call of messageToolCalls(response)) {
+      messages.push(toolResultMessage(call, { error: "No more tools available — return your final answer as text now." }));
+    }
+    response = await ask("none");
   }
 
-  return extractResponseText(response);
+  return stripThinkTags(messageText(response));
+}
+
+// The assistant turn as the server returned it (tool_calls included), with a
+// string `content` so servers that reject a null content still accept it.
+export function assistantTurn(response) {
+  const message = response?.choices?.[0]?.message || {};
+  return { ...message, role: "assistant", content: typeof message.content === "string" ? message.content : "" };
+}
+
+export function toolResultMessage(call, result) {
+  return { role: "tool", tool_call_id: call.id, content: JSON.stringify(result) };
+}
+
+// ---------------------------------------------------------------------------
+// Goal planning — one extra reasoning pass over the extracted tasks
+// ---------------------------------------------------------------------------
+
+// Ask the reasoning model to group the flat task list into business goals. On
+// any failure the agent model's own goals (or the heuristic grouping) are kept
+// and a warning is surfaced in the UI.
+async function planGoals({ tasks, targetGoals, rawGoals, config, emit }) {
+  const model = config.models.reasoning;
+  if (!tasks.length) return { rawGoals, warning: null, source: "agent" };
+
+  await emit({ type: "thinking", message: `Grouping ${tasks.length} task(s) into business goals with ${model}…` });
+  try {
+    const response = await chatCompletion({
+      model,
+      messages: [
+        { role: "system", content: goalSystemPrompt() },
+        { role: "user", content: goalUserPrompt(tasks, targetGoals) }
+      ],
+      temperature: 0.2,
+      max_tokens: Math.min(config.limits.maxOutputTokens, 6000)
+    }, { config });
+
+    const plan = parseGoalPlan(stripThinkTags(messageText(response)));
+    if (plan?.length) return { rawGoals: plan, warning: null, source: "reasoning" };
+    const warning = `The reasoning pass (${model}) returned no usable goal grouping, so the analysis model's goals were kept.`;
+    await emit({ type: "thinking", message: warning });
+    return { rawGoals, warning, source: "agent" };
+  } catch (error) {
+    const warning = `The reasoning pass (${model}) failed: ${error.message}. The analysis model's goals were kept.`;
+    await emit({ type: "thinking", message: warning });
+    return { rawGoals, warning, source: "agent" };
+  }
+}
+
+// Accept `{ goals: [...] }` or a bare array; keep only entries that name a goal.
+export function parseGoalPlan(text) {
+  const parsed = parseJsonObject(text) || parseJsonArray(text);
+  const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.goals) ? parsed.goals : null;
+  if (!list) return null;
+  const goals = list
+    .filter((goal) => goal && typeof goal === "object" && String(goal.title || "").trim())
+    .map((goal, index) => ({
+      id: String(goal.id || `goal-${index + 1}`),
+      title: String(goal.title).trim(),
+      summary: String(goal.summary || ""),
+      taskIds: (Array.isArray(goal.taskIds) ? goal.taskIds : []).map(String)
+    }));
+  return goals.length ? goals : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +362,72 @@ function analysisSystemPrompt() {
     "Be concise so the JSON stays complete: representative eventIds (not every event) and milestone steps (not every click).",
     "Return JSON only — no markdown fences, no prose outside the JSON."
   ].join("\n");
+}
+
+function analysisUserPrompt({ compactSummary, events, targetGoals }) {
+  return [
+    "Analyze these recorded computer-activity logs and figure out the BUSINESS PROBLEMS the person was solving — not which apps they used.",
+    "Use the tools to read across the WHOLE event set, search for evidence, inspect screenshots, and read transcripts where helpful. Don't judge from the first events alone — survey the timeline.",
+    "Method: (1) read the events; (2) for each action ask WHY it happened — which business process drove it (e.g. a meeting attended because of the monthly accounting close, or because of product work) — the 'why' is the goal, not the surface; (3) CONNECT events that belong together — even when they jump between different apps and are separated by time — because they serve one real-world outcome; (4) build the CHRONOLOGY of connected events that achieved each outcome; (5) GROUP by the business target/outcome; (6) only then produce the analysis.",
+    "Apps (SAP, a web browser, Excel, email, Slack, a terminal…) are just TOOLS, never the goal. Do NOT create goals like 'Google Chrome', 'SAP GUI', 'Research & browsing', or 'Writing & communication'. Those describe the tool or the verb, not the business problem — name the outcome instead.",
+    "Example: actions in SAP, then a browser, then Excel, then email might all be ONE goal: 'Book incoming invoices correctly' — the apps are incidental. Group them together. Likewise reading Bloomberg + checking email + a calendar might all serve 'Prepare for the investment review meeting'.",
+    targetGoals.length
+      ? [
+          "The user has DEFINED the business goals they care about. Organize the activity into THESE goals, using them as the goal titles (refine wording only slightly):",
+          ...targetGoals.map((goal, index) => `  ${index + 1}. ${goal}`),
+          "For each defined goal, find the connected events across apps and build the chronology that advanced it. Put activity that fits no defined goal under a final goal titled 'Other activity'. If a defined goal has no supporting activity, omit it and say so in the overview."
+        ].join("\n")
+      : "Infer the goals yourself from the evidence.",
+    "Three levels: GOAL = the business problem/outcome (cross-app); TASK = an end-to-end workflow that advances the goal (may span several apps); STEP = the concrete actions in chronological order.",
+    "Write everything for a non-technical reader: plain language, no CSS selectors, no raw event-type names.",
+    "Return final output as JSON only, with this exact top-level shape:",
+    "{ overview: string, performance: { summary: string, strengths: string[], bottlenecks: string[], recommendations: string[] }, goals: Goal[], tasks: Task[] }.",
+    "Each Goal: { id, title (the business outcome in plain language, e.g. 'Book incoming invoices correctly'), summary (the problem being solved and the apps it spanned), taskIds: string[] }.",
+    "Each Task: { id, title, summary, goalId, startTimestamp, endTimestamp, confidence (0-1), attempts (integer), outcome ('completed'|'incomplete'|'partial'), eventIds: string[] (a REPRESENTATIVE subset — the key evidence, not every event), steps: Step[] (milestones, not every click; cap ~12), performance: { timeSpent: string, friction: string[], automatable: boolean } }.",
+    "Each Step: { label (plain-language, e.g. 'Entered the invoice in SAP'), evidenceEventId, appName, timestamp, notes }.",
+    "Every task belongs to exactly one goal. Keep goals few and outcome-based (usually 2-6). Be concise so the JSON is complete and valid.",
+    "",
+    `Dataset summary: ${JSON.stringify(compactSummary)}.`,
+    `First events preview: ${JSON.stringify(events.slice(0, 18).map(compactEvent))}.`
+  ].join("\n");
+}
+
+function goalSystemPrompt() {
+  return [
+    "You group already-extracted workflow tasks into the BUSINESS GOALS they served.",
+    "A goal is a real-world outcome (e.g. 'Book incoming invoices correctly', 'Prepare the investment review'), never an app, a surface, or a verb like 'Research & browsing'.",
+    "Tasks that span different applications often serve ONE goal — group them together. Keep goals few (usually 2-6) and give each a plain-language title a non-technical manager would recognize.",
+    "Every task id must appear in exactly one goal. Use the task ids exactly as given.",
+    "Return JSON only, no prose and no markdown fences:",
+    '{ "goals": [ { "id": "goal-1", "title": "...", "summary": "...", "taskIds": ["task-1"] } ] }'
+  ].join("\n");
+}
+
+function goalUserPrompt(tasks, targetGoals = []) {
+  const lines = [];
+  if (targetGoals.length) {
+    lines.push(
+      "The user DEFINED the goals they care about. Use these as the goal titles (refine wording only slightly) and assign each task to the one it advanced:",
+      ...targetGoals.map((goal, index) => `  ${index + 1}. ${goal}`),
+      "Tasks that fit none of them go under a final goal titled 'Other activity'.",
+      ""
+    );
+  } else {
+    lines.push("Infer the goals from the tasks themselves.", "");
+  }
+  lines.push(
+    "Tasks to group:",
+    JSON.stringify(tasks.map((task) => ({
+      id: task.id,
+      title: task.title,
+      summary: task.summary,
+      apps: (task.apps || []).map((app) => app.name),
+      startTimestamp: task.startTimestamp,
+      endTimestamp: task.endTimestamp,
+      steps: (task.steps || []).slice(0, 8).map((step) => step.label).filter(Boolean)
+    })))
+  );
+  return lines.join("\n");
 }
 
 function chatSystemPrompt(analysis) {
@@ -379,14 +469,44 @@ function skillSystemPrompt() {
   ].join("\n");
 }
 
+function skillUserPrompt({ task, goal }) {
+  return [
+    "Write a reusable agent SKILL.md that GENERALIZES this observed workflow so an AI agent can complete SIMILAR cases in the future — not replay this one exact instance.",
+    `Observed task: "${task.title}".`,
+    `Task summary: ${task.summary || "(none)"}.`,
+    goal?.title ? `Business goal this serves: "${goal.title}"${goal.summary ? ` — ${goal.summary}` : ""}.` : "",
+    "Inspect the evidence with the tools (events, screenshots, transcripts) before writing, so the procedure is accurate.",
+    "",
+    "ABSTRACTION RULES (critical):",
+    "- Generalize to the CLASS of task. The skill title and steps should fit any similar case, e.g. 'Book a supplier invoice in SAP', NOT 'Book Acme invoice INV-2026-4471'.",
+    "- Replace every case-specific value (invoice numbers, vendor names, amounts, PO numbers, dates, person names, file names) with a NAMED PLACEHOLDER like {invoice_number}, {vendor}, {po_number}.",
+    "- For EVERY placeholder, say WHERE to find it: which app, screen, document, or field to read it from (e.g. '{po_number} — on the invoice PDF header, or matched in SAP ME23N').",
+    "- Capture decision points and branches you saw (e.g. 'if approval is rejected for wrong coding, correct the account assignment and repost') as general conditional steps.",
+    "- Mention the specific observed case ONLY as a short example, clearly labelled.",
+    "",
+    "The skill must be practical for an AI agent that can drive a Mac (browser + native apps). Use stable anchors (visible text, menu paths, transaction codes, URLs, accessibility labels, file paths) — never raw click coordinates. Never include secure or private values.",
+    "Return ONLY GitHub-flavored Markdown (no JSON, no code fences around the whole document) with these sections:",
+    "# <Generalized title — the class of task>",
+    "## Purpose — when to use this skill and which business goal it accomplishes (generalized).",
+    "## Inputs — for each variable the agent needs, a line: `{placeholder}` — what it is, and **where to find it** (app/screen/document/field).",
+    "## Required Access — apps, sites, systems, permissions.",
+    "## Procedure — numbered general steps with the app and the anchor to act on; include the conditional branches observed.",
+    "## Where to find details — a checklist mapping each piece of needed information to the source/system and how to locate it.",
+    "## Verification — how the agent confirms the goal was achieved.",
+    "## Notes & Risks — privacy, approval gates, edge cases. Reference the observed case only as an illustrative example.",
+    "",
+    `Observed steps (evidence to generalize, not to copy verbatim): ${JSON.stringify((task.steps || []).slice(0, 24))}.`,
+    `Apps involved: ${(task.apps || []).map((app) => app.name).join(", ") || "unknown"}.`
+  ].filter(Boolean).join("\n");
+}
+
 // ---------------------------------------------------------------------------
-// Tools
+// Tools — Chat Completions function schemas
 // ---------------------------------------------------------------------------
 
-function buildTools() {
+export function buildToolDefinitions() {
   return [
     {
-      type: "function",
       name: "list_events",
       description: "List a compact slice of recorded activity events in time order.",
       parameters: {
@@ -399,7 +519,6 @@ function buildTools() {
       }
     },
     {
-      type: "function",
       name: "search_events",
       description: "Search recorded events by text, app name, event type, URL, window title, control text, AI prompt, or AI response.",
       parameters: {
@@ -414,7 +533,6 @@ function buildTools() {
       }
     },
     {
-      type: "function",
       name: "get_event_detail",
       description: "Fetch full details for one event by event ID.",
       parameters: {
@@ -425,9 +543,8 @@ function buildTools() {
       }
     },
     {
-      type: "function",
       name: "inspect_screenshot",
-      description: "Inspect a screenshot attached to an event. Returns a visual summary generated with image input when the file is available.",
+      description: "Inspect a screenshot attached to an event. Returns a visual summary produced by the omni vision model when the file is available.",
       parameters: {
         type: "object",
         properties: { eventId: { type: "string" } },
@@ -436,7 +553,6 @@ function buildTools() {
       }
     },
     {
-      type: "function",
       name: "read_transcript",
       description: "Read a transcript file attached to an event.",
       parameters: {
@@ -448,13 +564,25 @@ function buildTools() {
         required: ["eventId"],
         additionalProperties: false
       }
+    },
+    {
+      name: "transcribe_recording",
+      description: "Transcribe a meeting or voice recording with the omni audio model and return its text. Give the ID of an event that has a recording, or a recording path relative to the recordings folder. Already-transcribed recordings are returned from disk. Slow — use it only when the recording matters to the answer.",
+      parameters: {
+        type: "object",
+        properties: {
+          eventId: { type: "string" },
+          recordingPath: { type: "string" },
+          maxChars: { type: "integer", minimum: 500, maximum: 12000 }
+        },
+        additionalProperties: false
+      }
     }
-  ];
+  ].map((tool) => ({ type: "function", function: tool }));
 }
 
-async function executeToolCall(call, context) {
-  const args = parseToolArguments(call.arguments);
-  switch (call.name) {
+async function executeToolCall(name, args, context) {
+  switch (name) {
     case "list_events":
       return listEvents(context.events, args);
     case "search_events":
@@ -465,12 +593,15 @@ async function executeToolCall(call, context) {
       return inspectScreenshot(context, args.eventId);
     case "read_transcript":
       return readTranscript(context, args.eventId, args.maxChars);
+    case "transcribe_recording":
+      return transcribeRecordingTool(context, args);
     default:
-      return { error: `Unknown tool: ${call.name}` };
+      return { error: `Unknown tool: ${name}` };
   }
 }
 
-function parseToolArguments(raw) {
+export function parseToolArguments(raw) {
+  if (raw && typeof raw === "object") return raw;
   try {
     return raw ? JSON.parse(raw) : {};
   } catch {
@@ -531,7 +662,8 @@ function searchEvents(events, { query = "", appName = "", eventType = "", limit 
       event.aiPrompt,
       event.aiResponse,
       event.screenshotPath,
-      event.transcriptPath
+      event.transcriptPath,
+      event.audioPath
     ].filter(Boolean).join("\n").toLowerCase().includes(needle);
   });
   return {
@@ -553,7 +685,8 @@ function getEventDetail(events, eventId) {
   };
 }
 
-async function inspectScreenshot({ events, activityRoot, apiKey, model }, eventId) {
+// Vision goes to the omni model as an image_url data URI part.
+async function inspectScreenshot({ events, activityRoot, config }, eventId) {
   const event = events.find((item) => item.id === eventId);
   if (!event) return { error: "Event not found." };
   if (!event.screenshotPath) return { error: "This event has no screenshot." };
@@ -564,28 +697,27 @@ async function inspectScreenshot({ events, activityRoot, apiKey, model }, eventI
     const data = await fs.readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
     const mime = ext === ".png" ? "image/png" : "image/jpeg";
-    const dataUrl = `data:${mime};base64,${data.toString("base64")}`;
-    const response = await callResponses(apiKey, {
-      model,
-      max_output_tokens: 1000,
-      input: [
+    const response = await omniChatCompletion({
+      messages: [
         {
           role: "user",
           content: [
             {
-              type: "input_text",
+              type: "text",
               text: [
                 "Describe this screenshot of recorded computer activity in plain language.",
                 "Cover the visible app/window, important on-screen text, the likely action, and anything useful for automation.",
                 `Event context: ${JSON.stringify(compactEvent(event))}`
               ].join("\n")
             },
-            { type: "input_image", image_url: dataUrl }
+            { type: "image_url", image_url: { url: `data:${mime};base64,${data.toString("base64")}` } }
           ]
         }
-      ]
-    });
-    return { eventId, screenshotPath: event.screenshotPath, summary: extractResponseText(response) };
+      ],
+      temperature: 0.2,
+      max_tokens: 1000
+    }, { config });
+    return { eventId, screenshotPath: event.screenshotPath, summary: stripThinkTags(messageText(response)) };
   } catch (error) {
     return { error: error.message, eventId, screenshotPath: event.screenshotPath };
   }
@@ -599,68 +731,63 @@ async function readTranscript({ events, activityRoot }, eventId, maxChars = 6000
   if (!filePath) return { error: "Invalid transcript path." };
   try {
     const text = await fs.readFile(filePath, "utf8");
-    const safeMax = Math.max(500, Math.min(12000, Number(maxChars) || 6000));
-    return { eventId, transcriptPath: event.transcriptPath, length: text.length, text: text.slice(0, safeMax) };
+    return { eventId, transcriptPath: event.transcriptPath, length: text.length, text: text.slice(0, clampChars(maxChars)) };
   } catch (error) {
     return { error: error.message, eventId, transcriptPath: event.transcriptPath };
   }
 }
 
-// ---------------------------------------------------------------------------
-// OpenAI transport
-// ---------------------------------------------------------------------------
+// On-demand transcription of a recording referenced by an event (or named
+// directly). Cached transcripts are read from disk instead of re-billed.
+async function transcribeRecordingTool({ events, activityRoot, config = getProviderConfig(), emit = async () => {} }, args = {}) {
+  let relativePath = String(args.recordingPath || "").trim() || null;
+  if (!relativePath && args.eventId) {
+    const event = events.find((item) => item.id === args.eventId);
+    if (!event) return { error: "Event not found." };
+    if (!event.audioPath) return { error: "This event has no recording." };
+    relativePath = event.audioPath;
+  }
+  if (!relativePath) return { error: "Provide an eventId whose event has a recording, or a recordingPath." };
+  if (!activityRoot) return { error: "No activity root is configured for this project." };
 
-async function callResponses(apiKey, body) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let response;
+  const filePath = resolveMediaPath(activityRoot, "recordings", relativePath);
+  if (!filePath) return { error: "Invalid recording path." };
+
+  const transcriptPath = transcriptPathForRecording(relativePath);
   try {
-    response = await fetch(OPENAI_RESPONSES_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+    if (await transcriptExists(activityRoot, relativePath)) {
+      const text = await fs.readFile(resolveMediaPath(activityRoot, "transcripts", transcriptPath), "utf8");
+      return { recordingPath: relativePath, transcriptPath, cached: true, length: text.length, text: text.slice(0, clampChars(args.maxChars)) };
+    }
+    const result = await transcribeRecording(filePath, { emit, activityRoot, relativePath, config });
+    return {
+      recordingPath: relativePath,
+      transcriptPath: result.transcriptPath,
+      cached: false,
+      model: result.model,
+      seconds: result.seconds,
+      length: result.text.length,
+      text: result.text.slice(0, clampChars(args.maxChars))
+    };
   } catch (error) {
-    clearTimeout(timeout);
-    if (error.name === "AbortError") {
-      throw new Error(`OpenAI request timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s.`);
-    }
-    throw error;
+    return { error: error.message, recordingPath: relativePath };
   }
-  clearTimeout(timeout);
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.error?.message || `OpenAI request failed (${response.status}).`);
-  }
-  return payload;
 }
 
-function getFunctionCalls(response) {
-  return (response.output || []).filter((item) => item.type === "function_call");
+function clampChars(value, fallback = 6000) {
+  return Math.max(500, Math.min(12000, Number(value) || fallback));
 }
 
-function extractResponseText(response) {
-  if (response.output_text) return response.output_text;
-  const chunks = [];
-  for (const item of response.output || []) {
-    if (item.type === "message") {
-      for (const part of item.content || []) {
-        if (part.type === "output_text" || part.type === "text") chunks.push(part.text);
-      }
-    }
-  }
-  return chunks.join("\n").trim();
-}
+// ---------------------------------------------------------------------------
+// Response parsing (pure)
+// ---------------------------------------------------------------------------
 
 function parseJsonObject(text) {
   const raw = stripJsonFences(String(text || "")).trim();
   if (!raw) return null;
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
   } catch {
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return null;
@@ -669,6 +796,18 @@ function parseJsonObject(text) {
     } catch {
       return null;
     }
+  }
+}
+
+function parseJsonArray(text) {
+  const raw = stripJsonFences(String(text || "")).trim();
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
 
@@ -697,9 +836,9 @@ function buildCompactSummary(events, summary) {
   };
 }
 
-function normalizeAgentAnalysis(analysis, events, model) {
+function normalizeAgentTasks(analysis, events) {
   const byId = new Map(events.map((event) => [event.id, event]));
-  const tasks = (analysis.tasks || []).map((task, index) => {
+  return (analysis.tasks || []).map((task, index) => {
     const taskEvents = (task.eventIds || []).map((id) => byId.get(id)).filter(Boolean);
     const fallbackEvents = taskEvents.length ? taskEvents : events.slice(0, 1);
     const metrics = computeTaskMetrics(fallbackEvents);
@@ -709,6 +848,7 @@ function normalizeAgentAnalysis(analysis, events, model) {
       id: task.id || `task-${index + 1}`,
       title: task.title || `Task ${index + 1}`,
       summary: task.summary || "",
+      goalId: task.goalId,
       confidence: clampNumber(task.confidence, 0, 1, 0.7),
       startTimestamp: task.startTimestamp || fallbackEvents[0]?.timestamp || null,
       endTimestamp: task.endTimestamp || fallbackEvents[fallbackEvents.length - 1]?.timestamp || null,
@@ -740,24 +880,13 @@ function normalizeAgentAnalysis(analysis, events, model) {
       events: fallbackEvents
     };
   });
-
-  const goals = buildGoals(analysis.goals, tasks);
-
-  return {
-    source: "openai",
-    model,
-    overview: analysis.overview || "",
-    performance: analysis.performance || {},
-    goals,
-    tasks
-  };
 }
 
-// Build the goal grouping over the flat task list. Prefers the model's goals
+// Build the goal grouping over the flat task list. Prefers the supplied goals
 // (matching by taskIds or each task's goalId), sweeps any leftover tasks into an
 // "Other activity" goal, and falls back to a heuristic grouping if none exist.
 // Mutates each task with its resolved `goalId`.
-function buildGoals(rawGoals, tasks) {
+export function buildGoals(rawGoals, tasks) {
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const assigned = new Set();
   const goals = [];
@@ -781,9 +910,9 @@ function buildGoals(rawGoals, tasks) {
   return goals.length ? goals : deriveGoalsFromTasks(tasks);
 }
 
-// Heuristic grouping when the model gives no goals (or for the offline analyzer):
+// Heuristic grouping when no usable goals exist (or for the offline analyzer):
 // cluster tasks by their dominant inferred verb, then app.
-function deriveGoalsFromTasks(tasks) {
+export function deriveGoalsFromTasks(tasks) {
   const titleForKey = {
     Code: "Coding & development",
     Research: "Research & browsing",
@@ -864,10 +993,11 @@ function heuristicAnalysis(events, summary, warning, targetGoals = []) {
   return {
     source: "heuristic",
     model: null,
+    models: null,
     warning,
     overview: `Recorded ${summary?.eventCount ?? events.length} events across ${summary?.dayCount ?? "an unknown number of"} day(s).`,
     performance: {
-      summary: "The built-in analyzer groups activity by time gaps and app/window continuity. Add an OpenAI key for richer, AI-driven task analysis.",
+      summary: "The built-in analyzer groups activity by time gaps and app/window continuity. Set NEBIUS_API_KEY for richer, Nemotron-driven task analysis.",
       strengths: [],
       bottlenecks: [],
       recommendations: []
@@ -891,6 +1021,7 @@ function compactEvent(event) {
     url: event.url || undefined,
     screenshotPath: event.screenshotPath || undefined,
     transcriptPath: event.transcriptPath || undefined,
+    audioPath: event.audioPath || undefined,
     aiPrompt: event.aiPrompt || undefined,
     aiResponse: event.aiResponse || undefined
   };
