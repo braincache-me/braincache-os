@@ -21,9 +21,18 @@ enum BrainCacheConfig {
     static let prodSettingsSuite = "com.clipvault.settings"
     static let devSettingsSuite = "com.clipvault.settings.dev"
 
-    /// Keychain service used by `Settings.openAIAPIKey`.
+    /// Keychain service used by `Settings.openAIAPIKey`. The account name is
+    /// still `openAIAPIKey` regardless of provider — the app keeps that
+    /// storage key for backward compatibility.
     static let keychainServiceName = "com.clipvault.openai"
     static let keychainAccountName = "openAIAPIKey"
+
+    /// Default base URLs, mirroring `AIProvider.defaultBaseURL` in the app.
+    static let nebiusBaseURL = "https://api.tokenfactory.nebius.com/v1"
+    static let openAIBaseURL = "https://api.openai.com/v1"
+
+    /// Dimension count stored in `clip_embeddings` (`EmbeddingGenerator.dimensions`).
+    static let embeddingDimensions = 256
 
     /// True when the user passed `--dev` to a CLI command. Stored on
     /// `BrainCacheConfig` so deep helpers can consult it without threading
@@ -92,20 +101,51 @@ enum BrainCacheConfig {
         activityRootURL()?.appendingPathComponent("summaries", isDirectory: true)
     }
 
-    static var embeddingModel: String {
-        defaults.string(forKey: "embeddingModel") ?? "text-embedding-3-small"
+    // MARK: - AI provider
+
+    /// The provider the app has selected (`aiProvider` in the shared defaults
+    /// suite). Defaults to Nebius Token Factory, matching the app.
+    static var aiProvider: String {
+        defaults.string(forKey: "aiProvider") ?? "nebius"
     }
 
-    // MARK: - OpenAI API key resolution
+    /// Base URL of the OpenAI-compatible API the CLI should talk to.
+    ///
+    /// Precedence: `AI_BASE_URL` env var > the app's `aiBaseURL` (only stored
+    /// for the custom provider) > the selected provider's default.
+    static var aiBaseURL: String {
+        if let env = ProcessInfo.processInfo.environment["AI_BASE_URL"], !env.isEmpty {
+            return env.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if aiProvider == "custom",
+           let stored = defaults.string(forKey: "aiBaseURL")?
+               .trimmingCharacters(in: .whitespacesAndNewlines),
+           !stored.isEmpty {
+            return stored
+        }
+        return aiProvider == "openai" ? openAIBaseURL : nebiusBaseURL
+    }
+
+    /// Embedding model the app is configured to use, defaulting per provider.
+    static var embeddingModel: String {
+        if let stored = defaults.string(forKey: "embeddingModel"), !stored.isEmpty {
+            return stored
+        }
+        return aiProvider == "openai" ? "text-embedding-3-small" : "Qwen/Qwen3-Embedding-8B"
+    }
+
+    // MARK: - API key resolution
     //
-    // Precedence: OPENAI_API_KEY env var > app's Keychain item > defaults
-    // (legacy, only used pre-migration). Returns nil if nothing is configured;
-    // callers that require a key surface a friendly error instead of crashing.
+    // Precedence: NEBIUS_API_KEY / OPENAI_API_KEY env vars > app's Keychain
+    // item > defaults (legacy, only used pre-migration). Returns nil if
+    // nothing is configured; callers that require a key surface a friendly
+    // error instead of crashing.
 
     static func openAIAPIKey() -> String? {
-        if let env = ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
-           !env.isEmpty {
-            return env
+        for name in ["NEBIUS_API_KEY", "OPENAI_API_KEY"] {
+            if let env = ProcessInfo.processInfo.environment[name], !env.isEmpty {
+                return env
+            }
         }
         if let key = readKeychainAPIKey(), !key.isEmpty {
             return key

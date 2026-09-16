@@ -7,9 +7,17 @@ final class AIPrefsView: NSView {
     private let scrollView = NSScrollView()
     private let contentView = FlippedPrefsContentView()
 
+    // MARK: - Provider section
+
+    private let providerLabel = NSTextField(labelWithString: "AI Provider:")
+    private let providerPopup = NSPopUpButton()
+
+    private let baseURLLabel = NSTextField(labelWithString: "Base URL:")
+    private let baseURLField = NSTextField()
+
     // MARK: - API Key section
 
-    private let apiKeyLabel = NSTextField(labelWithString: "OpenAI API Key:")
+    private let apiKeyLabel = NSTextField(labelWithString: "API Key:")
     private let apiKeyField = NSSecureTextField()
     private let validateButton = NSButton(title: "Validate", target: nil, action: nil)
     private let apiKeyHelpButton = NSButton(title: "How to get an API key", target: nil, action: nil)
@@ -18,6 +26,7 @@ final class AIPrefsView: NSView {
         "When an API key is set, BrainCache automatically classifies and tags each clipboard entry, " +
         "generates descriptions for images, and creates vector embeddings. " +
         "This enables semantic search and a conversational \"Chat with Data\" mode.")
+    private let providerInfoLabel = NSTextField(wrappingLabelWithString: "")
 
     private let pipelineStatusLabel = NSTextField(labelWithString: "Paused — no API key")
     private let repairIndexButton = NSButton(title: "Repair Index", target: nil, action: nil)
@@ -43,6 +52,11 @@ final class AIPrefsView: NSView {
 
     private let transcriptionModelLabel = NSTextField(labelWithString: "Transcription Model:")
     private let transcriptionModelPopup = NSPopUpButton()
+
+    private let chunkWindowLabel = NSTextField(labelWithString: "Chunk Window:")
+    private let chunkWindowField = NSTextField()
+    private let chunkWindowStepper = NSStepper()
+    private let chunkWindowUnitLabel = NSTextField(labelWithString: "seconds per audio chunk")
 
     private let translationModelLabel = NSTextField(labelWithString: "Translation Model:")
     private let translationModelPopup = NSPopUpButton()
@@ -139,6 +153,11 @@ final class AIPrefsView: NSView {
 
     private let resetDefaultsButton = NSButton(title: "Reset to Defaults", target: nil, action: nil)
 
+    /// Zero-height constraints that collapse the OpenAI-only rows (reasoning
+    /// effort, hosted web search) when another provider is selected. Activated
+    /// alongside `isHidden` so the rows don't leave a full-size gap.
+    private var openAIOnlyCollapseConstraints: [NSLayoutConstraint] = []
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         buildUI()
@@ -177,8 +196,43 @@ final class AIPrefsView: NSView {
     }
 
     private func configureControls() {
-        apiKeyField.placeholderString = "sk-..."
+        providerPopup.removeAllItems()
+        for provider in AIProvider.allCases {
+            let item = NSMenuItem(title: provider.displayName, action: nil, keyEquivalent: "")
+            item.representedObject = provider.rawValue
+            providerPopup.menu?.addItem(item)
+        }
+        providerPopup.target = self
+        providerPopup.action = #selector(providerChanged)
+        providerPopup.toolTip =
+            "NVIDIA Nemotron models on Nebius Token Factory (default), OpenAI, or any other OpenAI-compatible endpoint."
+
+        baseURLField.delegate = self
+        baseURLField.target = self
+        baseURLField.action = #selector(baseURLChanged)
+        baseURLField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+
+        providerInfoLabel.textColor = .secondaryLabelColor
+        providerInfoLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+
+        apiKeyField.placeholderString = "API key"
         apiKeyField.delegate = self
+
+        chunkWindowField.alignment = .right
+        chunkWindowField.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        chunkWindowField.target = self
+        chunkWindowField.action = #selector(chunkWindowChanged)
+        chunkWindowField.delegate = self
+        chunkWindowStepper.minValue = 4
+        chunkWindowStepper.maxValue = 60
+        chunkWindowStepper.increment = 1
+        chunkWindowStepper.valueWraps = false
+        chunkWindowStepper.target = self
+        chunkWindowStepper.action = #selector(chunkWindowStepped)
+        chunkWindowUnitLabel.textColor = .secondaryLabelColor
+        chunkWindowUnitLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        chunkWindowLabel.toolTip =
+            "Providers without a realtime socket transcribe buffered chunks of this length. Shorter feels more live; longer gives the model more context."
 
         validateButton.target = self
         validateButton.action = #selector(validateKey)
@@ -373,6 +427,7 @@ final class AIPrefsView: NSView {
 
     private func layoutContent() {
         let allViews: [NSView] = [
+            providerLabel, providerPopup, baseURLLabel, baseURLField, providerInfoLabel,
             apiKeyLabel, apiKeyField, validateButton, statusLabel, apiKeyHelpButton, infoLabel,
             pipelineStatusLabel, repairIndexButton, reindexButton, costLabel, costHistoryLabel,
             modelSectionLabel,
@@ -381,6 +436,7 @@ final class AIPrefsView: NSView {
             visionModelLabel, visionModelPopup,
             embeddingModelLabel, embeddingModelPopup,
             transcriptionModelLabel, transcriptionModelPopup,
+            chunkWindowLabel, chunkWindowField, chunkWindowStepper, chunkWindowUnitLabel,
             translationModelLabel, translationModelPopup,
             voiceRewriteModelLabel, voiceRewriteModelPopup,
             refreshModelsButton, modelsStatusLabel,
@@ -409,8 +465,27 @@ final class AIPrefsView: NSView {
         let m: CGFloat = 20  // margin
 
         NSLayoutConstraint.activate([
+            // Provider row
+            providerLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: m),
+            providerLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
+            providerLabel.widthAnchor.constraint(equalToConstant: 110),
+            providerPopup.centerYAnchor.constraint(equalTo: providerLabel.centerYAnchor),
+            providerPopup.leadingAnchor.constraint(equalTo: providerLabel.trailingAnchor, constant: 8),
+            providerPopup.widthAnchor.constraint(equalToConstant: 220),
+
+            baseURLLabel.topAnchor.constraint(equalTo: providerLabel.bottomAnchor, constant: 10),
+            baseURLLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
+            baseURLLabel.widthAnchor.constraint(equalToConstant: 110),
+            baseURLField.centerYAnchor.constraint(equalTo: baseURLLabel.centerYAnchor),
+            baseURLField.leadingAnchor.constraint(equalTo: baseURLLabel.trailingAnchor, constant: 8),
+            baseURLField.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -m),
+
+            providerInfoLabel.topAnchor.constraint(equalTo: baseURLLabel.bottomAnchor, constant: 6),
+            providerInfoLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
+            providerInfoLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -m),
+
             // API Key row
-            apiKeyLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: m),
+            apiKeyLabel.topAnchor.constraint(equalTo: providerInfoLabel.bottomAnchor, constant: 16),
             apiKeyLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
             apiKeyLabel.widthAnchor.constraint(equalToConstant: 110),
 
@@ -492,7 +567,19 @@ final class AIPrefsView: NSView {
             transcriptionModelPopup.leadingAnchor.constraint(equalTo: transcriptionModelLabel.trailingAnchor, constant: 8),
             transcriptionModelPopup.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -m),
 
-            translationModelLabel.topAnchor.constraint(equalTo: transcriptionModelLabel.bottomAnchor, constant: 10),
+            chunkWindowLabel.topAnchor.constraint(equalTo: transcriptionModelLabel.bottomAnchor, constant: 10),
+            chunkWindowLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
+            chunkWindowLabel.widthAnchor.constraint(equalToConstant: labelWidth),
+            chunkWindowField.centerYAnchor.constraint(equalTo: chunkWindowLabel.centerYAnchor),
+            chunkWindowField.leadingAnchor.constraint(equalTo: chunkWindowLabel.trailingAnchor, constant: 8),
+            chunkWindowField.widthAnchor.constraint(equalToConstant: 60),
+            chunkWindowStepper.centerYAnchor.constraint(equalTo: chunkWindowLabel.centerYAnchor),
+            chunkWindowStepper.leadingAnchor.constraint(equalTo: chunkWindowField.trailingAnchor, constant: 4),
+            chunkWindowUnitLabel.centerYAnchor.constraint(equalTo: chunkWindowLabel.centerYAnchor),
+            chunkWindowUnitLabel.leadingAnchor.constraint(equalTo: chunkWindowStepper.trailingAnchor, constant: 8),
+            chunkWindowUnitLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -m),
+
+            translationModelLabel.topAnchor.constraint(equalTo: chunkWindowLabel.bottomAnchor, constant: 10),
             translationModelLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
             translationModelLabel.widthAnchor.constraint(equalToConstant: labelWidth),
             translationModelPopup.centerYAnchor.constraint(equalTo: translationModelLabel.centerYAnchor),
@@ -665,11 +752,109 @@ final class AIPrefsView: NSView {
             resetDefaultsButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: m),
             resetDefaultsButton.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -m),
         ])
+
+        openAIOnlyCollapseConstraints = [
+            reasoningEffortLabel.heightAnchor.constraint(equalToConstant: 0),
+            reasoningEffortPopup.heightAnchor.constraint(equalToConstant: 0),
+            webSearchCheckbox.heightAnchor.constraint(equalToConstant: 0),
+            webSearchInfoLabel.heightAnchor.constraint(equalToConstant: 0),
+        ]
+    }
+
+    // MARK: - Provider
+
+    /// Shows the OpenAI-only controls only when OpenAI is the active provider,
+    /// and enables the Base URL field only for the Custom provider.
+    private func applyProviderVisibility() {
+        let provider = Settings.shared.aiProvider
+        let isOpenAI = Settings.shared.isOpenAIProvider
+
+        baseURLField.isEnabled = provider == .custom
+        baseURLField.isEditable = provider == .custom
+        baseURLField.textColor = provider == .custom ? .labelColor : .secondaryLabelColor
+
+        for view in [reasoningEffortLabel, reasoningEffortPopup,
+                     webSearchCheckbox, webSearchInfoLabel] as [NSView] {
+            view.isHidden = !isOpenAI
+        }
+        for constraint in openAIOnlyCollapseConstraints {
+            constraint.isActive = !isOpenAI
+        }
+
+        // The transcription popup lists realtime models on OpenAI and chat
+        // (omni) models everywhere else, so its hint changes too.
+        transcriptionModelLabel.toolTip = isOpenAI
+            ? "Realtime transcription model used by the voice panel."
+            : "Omni chat model used to transcribe buffered audio chunks."
+        chunkWindowLabel.isEnabled = !isOpenAI
+        chunkWindowField.isEnabled = !isOpenAI
+        chunkWindowStepper.isEnabled = !isOpenAI
+
+        providerInfoLabel.stringValue = {
+            switch provider {
+            case .nebius:
+                return "NVIDIA Nemotron models served by Nebius Token Factory. Voice transcription runs through the Nemotron omni model in chunks — there is no realtime socket."
+            case .openai:
+                return "OpenAI's API. Enables the Responses API (thinking traces), hosted web search, and realtime voice transcription."
+            case .custom:
+                return "Any OpenAI-compatible endpoint. Set the base URL below (it must expose /chat/completions, /embeddings and /models)."
+            }
+        }()
+
+        apiKeyHelpButton.title = provider == .openai
+            ? "How to get an OpenAI API key"
+            : "Get a Nebius Token Factory API key"
+    }
+
+    private func loadProviderValues() {
+        let provider = Settings.shared.aiProvider
+        for item in providerPopup.itemArray where (item.representedObject as? String) == provider.rawValue {
+            providerPopup.select(item)
+        }
+        baseURLField.stringValue = Settings.shared.aiBaseURL
+        applyProviderVisibility()
+    }
+
+    @objc private func providerChanged() {
+        guard let raw = providerPopup.selectedItem?.representedObject as? String,
+              let provider = AIProvider(rawValue: raw) else { return }
+        // Setting the provider clears the stored model IDs so they fall back
+        // to the new provider's defaults instead of 404-ing on every request.
+        Settings.shared.aiProvider = provider
+        loadProviderValues()
+        loadModelPopups()
+        loadChatConfigValues()
+        NotificationCenter.default.post(name: .clipVaultAPIKeyDidChange, object: nil)
+    }
+
+    @objc private func baseURLChanged() {
+        guard Settings.shared.aiProvider == .custom else { return }
+        Settings.shared.aiBaseURL = baseURLField.stringValue
+        baseURLField.stringValue = Settings.shared.aiBaseURL
+        NotificationCenter.default.post(name: .clipVaultAPIKeyDidChange, object: nil)
+    }
+
+    @objc private func chunkWindowChanged() {
+        Settings.shared.chunkedTranscriptionWindowSeconds =
+            integerValue(from: chunkWindowField, fallback: Settings.shared.chunkedTranscriptionWindowSeconds)
+        syncChunkWindowControls()
+    }
+
+    @objc private func chunkWindowStepped() {
+        Settings.shared.chunkedTranscriptionWindowSeconds = chunkWindowStepper.integerValue
+        syncChunkWindowControls()
+    }
+
+    private func syncChunkWindowControls() {
+        let value = Settings.shared.chunkedTranscriptionWindowSeconds
+        chunkWindowField.integerValue = value
+        chunkWindowStepper.integerValue = value
     }
 
     // MARK: - Load Values
 
     private func loadValues() {
+        loadProviderValues()
         apiKeyField.stringValue = Settings.shared.openAIAPIKey
         updateStatusLabel()
         updatePipelineStatus(AIIndexingPipeline.shared.state)
@@ -699,18 +884,28 @@ final class AIPrefsView: NSView {
         let transcriptionModels: [String]
         let translationModels: [String]
 
+        // Only OpenAI has dedicated realtime transcription / translation
+        // models. Elsewhere transcription runs through an omni *chat* model,
+        // so those popups list the chat models instead.
+        let isOpenAI = Settings.shared.isOpenAIProvider
+
         if cached.isEmpty {
             chatModels = OpenAIClient.defaultChatModels
             embModels = OpenAIClient.defaultEmbeddingModels
-            transcriptionModels = OpenAIUsageCost.defaultTranscriptionModels
-            translationModels = OpenAIClient.defaultTranslationModels
+            transcriptionModels = isOpenAI ? OpenAIUsageCost.defaultTranscriptionModels : chatModels
+            translationModels = isOpenAI ? OpenAIClient.defaultTranslationModels : chatModels
         } else {
             chatModels = OpenAIClient.chatModels(from: cached)
             embModels = OpenAIClient.embeddingModels(from: cached)
-            let fromAPI = OpenAIClient.transcriptionModels(from: cached)
-            transcriptionModels = fromAPI.isEmpty ? OpenAIUsageCost.defaultTranscriptionModels : fromAPI
-            let translationFromAPI = OpenAIClient.translationModels(from: cached)
-            translationModels = translationFromAPI.isEmpty ? OpenAIClient.defaultTranslationModels : translationFromAPI
+            if isOpenAI {
+                let fromAPI = OpenAIClient.transcriptionModels(from: cached)
+                transcriptionModels = fromAPI.isEmpty ? OpenAIUsageCost.defaultTranscriptionModels : fromAPI
+                let translationFromAPI = OpenAIClient.translationModels(from: cached)
+                translationModels = translationFromAPI.isEmpty ? OpenAIClient.defaultTranslationModels : translationFromAPI
+            } else {
+                transcriptionModels = chatModels
+                translationModels = chatModels
+            }
         }
 
         populatePopup(chatModelPopup, models: chatModels, selected: Settings.shared.chatModel)
@@ -832,6 +1027,8 @@ final class AIPrefsView: NSView {
 
         summariseAutoCheckbox.state = s.transcriptionAutoSummariseEnabled ? .on : .off
         summarisePromptTextView.string = s.transcriptionSummarisationPrompt
+
+        syncChunkWindowControls()
     }
 
     private func updateContextCharsLabel(_ chars: Int) {
@@ -1089,8 +1286,10 @@ final class AIPrefsView: NSView {
         Settings.shared.aiAssistSystemPrompt = Settings.Defaults.aiAssistSystemPrompt
         Settings.shared.transcriptionAutoSummariseEnabled = Settings.Defaults.transcriptionAutoSummariseEnabled
         Settings.shared.transcriptionSummarisationPrompt = ""
+        Settings.shared.chunkedTranscriptionWindowSeconds = Settings.Defaults.chunkedTranscriptionWindowSeconds
         loadModelPopups()
         loadChatConfigValues()
+        applyProviderVisibility()
     }
 
     @objc private func resetSystemPrompt() {
@@ -1198,14 +1397,14 @@ final class AIPrefsView: NSView {
     // MARK: - Actions
 
     @objc private func openAPIKeyInstructions() {
-        guard let url = URL(string: "https://platform.openai.com/docs/api-reference/create-and-export-an-api-key") else {
-            statusLabel.stringValue = "Couldn't open the OpenAI API key instructions"
+        guard let url = URL(string: Settings.shared.aiProvider.apiKeyURL) else {
+            statusLabel.stringValue = "Couldn't open the API key instructions"
             statusLabel.textColor = .systemRed
             return
         }
 
         if !NSWorkspace.shared.open(url) {
-            statusLabel.stringValue = "Couldn't open the OpenAI API key instructions"
+            statusLabel.stringValue = "Couldn't open the API key instructions"
             statusLabel.textColor = .systemRed
         }
     }
@@ -1320,6 +1519,10 @@ extension AIPrefsView: NSTextFieldDelegate {
             contextMessageLimitChanged()
         } else if field === agenticMaxIterationsField {
             agenticMaxIterationsChanged()
+        } else if field === baseURLField {
+            baseURLChanged()
+        } else if field === chunkWindowField {
+            chunkWindowChanged()
         }
     }
 }

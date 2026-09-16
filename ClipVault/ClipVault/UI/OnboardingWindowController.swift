@@ -53,7 +53,7 @@ final class OnboardingWindowController: NSWindowController {
             case .hotkey:
                 return "Press the shortcut any time, search what you copied, then hit Return to paste the selected item right back where you were working."
             case .ai:
-                return "The core app stays local and free. If you want smarter search, summaries, and image indexing, you can add your own OpenAI API key later."
+                return "The core app stays local and free. If you want smarter search, summaries, and image indexing, you can add your own AI provider API key later — BrainCache ships with NVIDIA Nemotron on Nebius Token Factory."
             case .transcription:
                 return "Hit a shortcut to dictate from anywhere, flip on System audio to capture meetings, then turn the transcript into clean notes when you're done."
             case .writingAssistant:
@@ -614,7 +614,7 @@ final class OnboardingWindowController: NSWindowController {
         let aiCard = makeFeatureCard(
             symbol: "sparkles",
             tint: .systemPurple,
-            title: "Bring your own OpenAI key",
+            title: "Bring your own AI key",
             body: "AI is optional. If you want it, adding your own key unlocks better search, summaries of found items, and indexing for images.",
             footer: aiFooter
         )
@@ -625,7 +625,7 @@ final class OnboardingWindowController: NSWindowController {
         cards.distribution = .fillEqually
 
         let noteLabel = NSTextField(
-            wrappingLabelWithString: "BrainCache never makes OpenAI requests unless you explicitly paste in an API key."
+            wrappingLabelWithString: "BrainCache never calls an AI provider unless you explicitly paste in an API key. The default provider is NVIDIA Nemotron on Nebius Token Factory; OpenAI stays selectable in Preferences → AI."
         )
         noteLabel.font = .systemFont(ofSize: 12)
         noteLabel.textColor = .secondaryLabelColor
@@ -669,7 +669,7 @@ final class OnboardingWindowController: NSWindowController {
         cards.distribution = .fillEqually
 
         let noteLabel = NSTextField(
-            wrappingLabelWithString: "System audio capture needs Screen Recording permission. Voice transcription uses your OpenAI key — no key, no transcription."
+            wrappingLabelWithString: "System audio capture needs Screen Recording permission. Voice transcription uses your AI provider key — no key, no transcription."
         )
         noteLabel.font = .systemFont(ofSize: 12)
         noteLabel.textColor = .secondaryLabelColor
@@ -1608,7 +1608,7 @@ final class OnboardingWindowController: NSWindowController {
     }
 
     @objc private func openOpenAIAPIKeyGuide() {
-        _ = NSWorkspace.shared.open(Self.openAIAPIKeyGuideURL)
+        _ = NSWorkspace.shared.open(URL(string: Settings.shared.aiProvider.apiKeyURL) ?? Self.openAIAPIKeyGuideURL)
     }
 
     @objc private func handleAppDidBecomeActive() {

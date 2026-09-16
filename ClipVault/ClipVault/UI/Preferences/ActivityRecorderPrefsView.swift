@@ -54,7 +54,7 @@ final class ActivityRecorderPrefsView: NSView {
     )
     private let meetingHintLabel = NSTextField(wrappingLabelWithString:
         "Off: ignore meeting mic activity.  Audio: save mic + system to an .m4a.  " +
-        "Transcript: stream mic + system to OpenAI and save the text.  " +
+        "Transcript: transcribe mic + system audio and save the text.  " +
         "Recording starts when another app opens the mic and stops once it's released " +
         "for the delay below.")
     private let meetingSilenceLabel = NSTextField(labelWithString: "Stop after mic released")
@@ -730,7 +730,7 @@ final class ActivityRecorderPrefsView: NSView {
             }
             guard Settings.shared.isAIEnabled else {
                 revertMeetingMode(reason:
-                    "Add your OpenAI API key in Preferences → AI to enable transcript recording.")
+                    "Add your API key in Preferences → AI to enable transcript recording.")
                 return
             }
         }

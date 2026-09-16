@@ -30,7 +30,7 @@ final class TextRewriteService {
         guard snapshot.canAttemptRewrite else { return }
         guard Settings.shared.isAIEnabled else {
             WritingAssistantHUD.shared.showError(
-                "Add an OpenAI API key in Preferences → AI to use rewrite.", near: anchor)
+                "Add an API key in Preferences → AI to use rewrite.", near: anchor)
             return
         }
 
@@ -400,7 +400,7 @@ enum WritingAssistantServiceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .apiKeyMissing:
-            return "Add an OpenAI API key in Preferences > AI to use the writing assistant."
+            return "Add an API key in Preferences > AI to use the writing assistant."
         case .emptyInstruction:
             return "Type what you want the assistant to do."
         case .emptyResponse:

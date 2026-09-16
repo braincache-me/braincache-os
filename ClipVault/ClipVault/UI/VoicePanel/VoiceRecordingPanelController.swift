@@ -1168,7 +1168,7 @@ final class VoiceRecordingPanelController {
     /// normal way.
     @objc private func askAITapped() {
         guard Settings.shared.isAIEnabled else {
-            setBanner("Set an OpenAI API key in Preferences → AI to use Ask AI.", severity: .warning)
+            setBanner("Set an API key in Preferences → AI to use Ask AI.", severity: .warning)
             return
         }
         let text = service.transcript.combined.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1718,7 +1718,7 @@ final class VoiceRecordingPanelController {
     private func submitCustomPrompt() {
         guard Settings.shared.isAIEnabled else {
             customPromptPopover?.performClose(nil)
-            setBanner("Set an OpenAI API key in Preferences → AI to use Ask AI.", severity: .warning)
+            setBanner("Set an API key in Preferences → AI to use Ask AI.", severity: .warning)
             return
         }
         let question = (customPromptTextView?.string ?? "")

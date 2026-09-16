@@ -33,8 +33,8 @@ final class MeetingTranscriptRecorder: MeetingTranscriptRecording {
     }
 
     private let recorder = VoiceTranscriptionRecorder()
-    private var micClient: RealtimeTranscriptionClient?
-    private var systemClient: RealtimeTranscriptionClient?
+    private var micClient: RealtimeAudioStreamingClient?
+    private var systemClient: RealtimeAudioStreamingClient?
 
     private var outputURL: URL?
     private var relativePath: String?
@@ -83,7 +83,7 @@ final class MeetingTranscriptRecorder: MeetingTranscriptRecording {
             throw RecorderError.screenRecordingPermissionDenied
         }
         guard Settings.shared.isAIEnabled else {
-            log("start aborted: OpenAI API key not configured")
+            log("start aborted: AI API key not configured")
             throw RecorderError.apiKeyMissing
         }
         log("starting (output=\(outputDirectory.path))")
@@ -199,11 +199,12 @@ final class MeetingTranscriptRecorder: MeetingTranscriptRecording {
 
     // MARK: - Realtime clients
 
-    private func makeClient(source: RealtimeTranscriptionClient.Source) -> RealtimeTranscriptionClient {
-        let client = RealtimeTranscriptionClient(
-            source: source,
-            model: Settings.shared.transcriptionModel
-        )
+    /// Realtime sockets are OpenAI-only; other providers transcribe through
+    /// the chunked omni path. Both conform to `RealtimeAudioStreamingClient`.
+    private func makeClient(source: RealtimeTranscriptionClient.Source) -> RealtimeAudioStreamingClient {
+        let client: RealtimeAudioStreamingClient = Settings.shared.isOpenAIProvider
+            ? RealtimeTranscriptionClient(source: source, model: Settings.shared.transcriptionModel)
+            : ChunkedTranscriptionClient(source: source, model: Settings.shared.transcriptionModel)
         client.onPartial = { [weak self] delta in
             self?.appendPartial(delta, source: source)
         }
@@ -314,7 +315,7 @@ final class MeetingTranscriptRecorder: MeetingTranscriptRecording {
             case .alreadyRecording: return "A meeting transcript is already in progress."
             case .micPermissionDenied: return "Microphone access denied."
             case .screenRecordingPermissionDenied: return "Screen Recording permission is required for system audio."
-            case .apiKeyMissing: return "OpenAI API key is not configured."
+            case .apiKeyMissing: return "AI API key is not configured."
             }
         }
     }

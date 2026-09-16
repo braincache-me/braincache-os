@@ -220,7 +220,7 @@ final class ContentClassifierTests: XCTestCase {
     func testClassifyCallsLLMWithCorrectModelAndNoTemperature() async throws {
         MockURLProtocol.requestHandler = { request in
             let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
-            XCTAssertEqual(body["model"] as? String, "gpt-5.4-nano")
+            XCTAssertEqual(body["model"] as? String, Settings.shared.classificationModel)
             XCTAssertNil(body["temperature"],
                          "ContentClassifier must not send temperature — reasoning models reject it")
             let format = body["response_format"] as! [String: String]

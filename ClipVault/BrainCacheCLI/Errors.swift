@@ -34,18 +34,18 @@ enum CLIError: Error, CustomStringConvertible {
             return "Could not parse date '\(raw)'. Expected YYYY-MM-DD or an ISO-8601 datetime."
         case .missingAPIKey:
             return """
-            No OpenAI API key found.
+            No AI API key found.
 
             Vector search and AI commands need a key. Either:
-              1. Set OPENAI_API_KEY in your environment, or
+              1. Set NEBIUS_API_KEY (or OPENAI_API_KEY) in your environment, or
               2. Configure it in BrainCache → Preferences → AI.
             """
         case .openAIRequestFailed(let status, let body):
-            return "OpenAI request failed with HTTP \(status):\n\(body)"
+            return "AI request failed with HTTP \(status):\n\(body)"
         case .openAIUnauthorized:
-            return "OpenAI rejected the API key (HTTP 401). Update the key in BrainCache → Preferences → AI."
+            return "The AI provider rejected the API key (HTTP 401). Update the key in BrainCache → Preferences → AI."
         case .openAITransport(let error):
-            return "Network error talking to OpenAI: \(error.localizedDescription)"
+            return "Network error talking to the AI provider: \(error.localizedDescription)"
         case .invalidEmbeddingDimensions(let expected, let got):
             return """
             Embedding dimension mismatch: stored clips use \(expected)-dim vectors but the query

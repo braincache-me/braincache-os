@@ -32,9 +32,9 @@ final class ImageDescriber {
             content: systemPrompt
         )
 
-        do {
+        func describe(with model: String) async throws -> String? {
             let response = try await client.chatCompletionWithVision(
-                model: Settings.shared.visionModel,
+                model: model,
                 messages: [systemMessage],
                 imageData: dataToSend,
                 detail: "low",
@@ -42,7 +42,19 @@ final class ImageDescriber {
                 usageCategory: .indexing
             )
             return response.choices.first?.message.content
+        }
+
+        let model = Settings.shared.visionModel
+        do {
+            return try await describe(with: model)
         } catch {
+            // The default Nemotron omni ID is the least stable part of the
+            // Nebius configuration — on a model-not-found, ask /models for the
+            // live omni ID, persist it, and retry once.
+            if OmniModelResolver.isModelNotFound(error),
+               let resolved = await OmniModelResolver.resolveAndPersist(failedModel: model, client: client) {
+                if let retried = try? await describe(with: resolved) { return retried }
+            }
             NSLog("ClipVault: image description request failed: %@", error.localizedDescription)
             return nil
         }

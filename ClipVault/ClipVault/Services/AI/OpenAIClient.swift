@@ -47,8 +47,13 @@ struct ChatResponse: Codable {
             init(from decoder: Decoder) throws {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
                 role = try container.decode(String.self, forKey: .role)
-                // The OpenAI API may return null content when finish_reason is "tool_calls".
-                content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+                // The API may return null content when finish_reason is "tool_calls".
+                let rawContent = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+                // Nemotron-style reasoning models inline a `<think>…</think>`
+                // block in the completion; OpenAI never does. Strip it here so
+                // every consumer (RAG, classification JSON, rewrite) sees only
+                // the answer.
+                content = Settings.shared.isOpenAIProvider ? rawContent : ThinkTagFilter.strip(rawContent)
                 toolCalls = try container.decodeIfPresent([ToolCallResponse].self, forKey: .toolCalls)
             }
 
@@ -115,15 +120,15 @@ enum OpenAIError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .apiKeyMissing:
-            return "OpenAI API key is not configured. Add one in Preferences → AI."
+            return "AI API key is not configured. Add one in Preferences → AI."
         case .httpError(let statusCode, let message):
-            return "OpenAI API error (\(statusCode)): \(message)"
+            return "AI API error (\(statusCode)): \(message)"
         case .noChoices:
-            return "OpenAI returned an empty response (no choices)."
+            return "The AI provider returned an empty response (no choices)."
         case .noEmbedding:
-            return "OpenAI returned no embedding data."
+            return "The AI provider returned no embedding data."
         case .decodingFailed:
-            return "Failed to decode the OpenAI API response."
+            return "Failed to decode the AI provider's API response."
         }
     }
 }
@@ -135,7 +140,17 @@ final class OpenAIClient {
     static let shared = OpenAIClient()
 
     private let session: URLSession
-    private let baseURL = URL(string: "https://api.openai.com/v1")!
+    /// Resolved from `Settings.aiBaseURL` on every call so switching provider
+    /// (or editing a custom endpoint) takes effect immediately, exactly like
+    /// API-key rotation.
+    var baseURL: URL {
+        URL(string: Settings.shared.aiBaseURL) ?? URL(fileURLWithPath: "/")
+    }
+
+    /// True when requests go to OpenAI itself. Gates the OpenAI-only surfaces
+    /// (Responses API, hosted `web_search`, `reasoning.summary`) and the
+    /// `<think>` stripping that open-weight reasoning models need.
+    var isOpenAIProvider: Bool { Settings.shared.isOpenAIProvider }
     /// Initial retry delay in nanoseconds. Doubles on each retry (1s → 2s → 4s by default).
     let initialRetryDelay: UInt64
 
@@ -314,7 +329,9 @@ final class OpenAIClient {
             body["response_format"] = ["type": responseFormat.rawValue]
         }
         if let maxTokens { body["max_completion_tokens"] = maxTokens }
-        if let reasoningEffort, !reasoningEffort.isEmpty {
+        // `reasoning_effort` is an OpenAI-only parameter; other gateways 400
+        // on unknown top-level fields.
+        if let reasoningEffort, !reasoningEffort.isEmpty, isOpenAIProvider {
             body["reasoning_effort"] = reasoningEffort
         }
         if let tools, !tools.isEmpty {
@@ -358,7 +375,9 @@ final class OpenAIClient {
             "messages": messages,
         ]
         if let maxTokens { body["max_completion_tokens"] = maxTokens }
-        if let reasoningEffort, !reasoningEffort.isEmpty {
+        // `reasoning_effort` is an OpenAI-only parameter; other gateways 400
+        // on unknown top-level fields.
+        if let reasoningEffort, !reasoningEffort.isEmpty, isOpenAIProvider {
             body["reasoning_effort"] = reasoningEffort
         }
         if let tools, !tools.isEmpty {
@@ -448,6 +467,12 @@ final class OpenAIClient {
                         }
                     }
 
+                    // Open-weight reasoning models inline `<think>` blocks in
+                    // the stream; the filter buffers across delta boundaries so
+                    // a tag split between chunks is still removed.
+                    let stripsThinkTags = !self.isOpenAIProvider
+                    var thinkFilter = ThinkTagFilter()
+
                     var body: [String: Any] = [
                         "model": model,
                         "messages": messagePayload,
@@ -455,7 +480,7 @@ final class OpenAIClient {
                         "stream_options": ["include_usage": true],
                     ]
                     if let maxTokens { body["max_completion_tokens"] = maxTokens }
-                    if let reasoningEffort, !reasoningEffort.isEmpty {
+                    if let reasoningEffort, !reasoningEffort.isEmpty, self.isOpenAIProvider {
                         body["reasoning_effort"] = reasoningEffort
                     }
 
@@ -493,7 +518,8 @@ final class OpenAIClient {
                         else { continue }
 
                         if let token = self.extractStreamToken(from: json), !token.isEmpty {
-                            continuation.yield(token)
+                            let visible = stripsThinkTags ? thinkFilter.feed(token) : token
+                            if !visible.isEmpty { continuation.yield(visible) }
                         }
                         if let usage = json["usage"] as? [String: Any] {
                             let inputTokens = (usage["prompt_tokens"] as? Int) ?? 0
@@ -507,6 +533,10 @@ final class OpenAIClient {
                                 cachedInputTokens: cachedTokens
                             )
                         }
+                    }
+                    if stripsThinkTags {
+                        let tail = thinkFilter.flush()
+                        if !tail.isEmpty { continuation.yield(tail) }
                     }
                     continuation.finish()
                 } catch {
@@ -558,6 +588,25 @@ final class OpenAIClient {
                 do {
                     guard Settings.shared.isAIEnabled else {
                         throw OpenAIError.apiKeyMissing
+                    }
+
+                    // Only OpenAI serves `/responses`. Everywhere else the same
+                    // event surface is produced from a streaming chat
+                    // completion — see `streamResponseViaChatCompletions`.
+                    guard self.isOpenAIProvider else {
+                        try await self.streamResponseViaChatCompletions(
+                            model: model,
+                            instructions: instructions,
+                            userContentBlocks: userContentBlocks,
+                            previousResponseId: previousResponseId,
+                            functionOutputs: functionOutputs,
+                            tools: tools,
+                            maxOutputTokens: maxOutputTokens,
+                            usageCategory: usageCategory,
+                            continuation: continuation
+                        )
+                        continuation.finish()
+                        return
                     }
 
                     func makeBody(includeReasoningSummary: Bool) -> [String: Any] {
@@ -660,6 +709,269 @@ final class OpenAIClient {
         }
     }
 
+    // MARK: - Responses-API emulation over Chat Completions
+
+    /// Produces the `ResponsesStreamEvent` surface from a streaming chat
+    /// completion, for providers that don't serve `POST /responses`.
+    ///
+    /// Differences from the real Responses API, all handled here:
+    /// - Tools are converted from the flat Responses schema to the nested
+    ///   chat-completions shape; hosted tools (`web_search`) are dropped.
+    /// - There is no `reasoning.summary`, so no `.reasoningDelta` is emitted.
+    /// - There is no server-side conversation store, so the message history is
+    ///   kept in `ResponsesChatSessionStore` and addressed by a synthetic
+    ///   response id handed back through `.completed`. A continuation round
+    ///   replays that history plus one `role:"tool"` message per call.
+    private func streamResponseViaChatCompletions(
+        model: String,
+        instructions: String,
+        userContentBlocks: [[String: Any]],
+        previousResponseId: String?,
+        functionOutputs: [FunctionCallOutput],
+        tools: [[String: Any]],
+        maxOutputTokens: Int?,
+        usageCategory: AIUsageCategory,
+        continuation: AsyncThrowingStream<ResponsesStreamEvent, Error>.Continuation
+    ) async throws {
+        var messages: [[String: Any]]
+        if let previousResponseId,
+           let stored = ResponsesChatSessionStore.shared.messages(for: previousResponseId) {
+            messages = stored
+            messages.append(contentsOf: ResponsesChatCompletionsBridge.toolResultMessages(
+                outputs: functionOutputs.map { ($0.callId, $0.output) }
+            ))
+        } else {
+            messages = ResponsesChatCompletionsBridge.chatMessages(
+                instructions: instructions,
+                userContentBlocks: userContentBlocks
+            )
+        }
+
+        let converted = ResponsesChatCompletionsBridge.chatTools(from: tools)
+        ResponsesChatCompletionsBridge.logSkippedHostedTools(converted.skippedHostedTools)
+
+        var body: [String: Any] = [
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "stream_options": ["include_usage": true],
+        ]
+        if let maxOutputTokens { body["max_completion_tokens"] = maxOutputTokens }
+        if !converted.tools.isEmpty {
+            body["tools"] = converted.tools
+            body["tool_choice"] = "auto"
+        }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("/chat/completions"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(Settings.shared.openAIAPIKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OpenAIError.httpError(statusCode: 0, message: "non-HTTP response")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count >= 4096 { break }
+            }
+            let message = extractErrorMessage(from: data) ?? "HTTP \(http.statusCode)"
+            throw OpenAIError.httpError(statusCode: http.statusCode, message: message)
+        }
+
+        var thinkFilter = ThinkTagFilter()
+        var accumulator = StreamingToolCallAccumulator()
+        var assistantText = ""
+        var usage: ResponsesUsage?
+
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload.isEmpty { continue }
+            if payload == "[DONE]" { break }
+            guard let data = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            if let delta = Self.streamDelta(from: json) {
+                if let token = delta["content"] as? String, !token.isEmpty {
+                    assistantText += token
+                    let visible = thinkFilter.feed(token)
+                    if !visible.isEmpty { continuation.yield(.textDelta(visible)) }
+                }
+                if let calls = delta["tool_calls"] as? [[String: Any]] {
+                    accumulator.ingest(calls)
+                }
+            }
+            if let u = json["usage"] as? [String: Any] {
+                let cached = ((u["prompt_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int) ?? 0
+                usage = ResponsesUsage(
+                    inputTokens: (u["prompt_tokens"] as? Int) ?? 0,
+                    outputTokens: (u["completion_tokens"] as? Int) ?? 0,
+                    cachedInputTokens: cached
+                )
+            }
+        }
+
+        let tail = thinkFilter.flush()
+        if !tail.isEmpty { continuation.yield(.textDelta(tail)) }
+
+        let calls = accumulator.finish()
+        for call in calls {
+            continuation.yield(.functionCall(callId: call.callId, name: call.name, arguments: call.arguments))
+        }
+
+        // Store the history this round produced so the next round can continue
+        // it: every tool call in the assistant message must be answered by a
+        // `role:"tool"` message, which the caller supplies as functionOutputs.
+        var nextMessages = messages
+        if calls.isEmpty {
+            nextMessages.append(["role": "assistant", "content": assistantText])
+        } else {
+            nextMessages.append(ResponsesChatCompletionsBridge.assistantToolCallMessage(calls: calls))
+        }
+        let responseId = ResponsesChatSessionStore.shared.store(nextMessages)
+
+        if let usage {
+            recordUsage(
+                model: model,
+                category: usageCategory,
+                inputTokens: usage.inputTokens,
+                outputTokens: usage.outputTokens,
+                cachedInputTokens: usage.cachedInputTokens
+            )
+        }
+        continuation.yield(.completed(responseId: responseId, usage: usage))
+    }
+
+    /// Extracts `choices[0].delta` from a chat-completions SSE chunk.
+    static func streamDelta(from json: [String: Any]) -> [String: Any]? {
+        guard let choices = json["choices"] as? [[String: Any]],
+              let first = choices.first else { return nil }
+        return first["delta"] as? [String: Any]
+    }
+
+    /// Reassembles `tool_calls` that arrive as indexed fragments across SSE
+    /// deltas (id and name in the first fragment, argument JSON in pieces).
+    struct StreamingToolCallAccumulator {
+        private struct Partial {
+            var id = ""
+            var name = ""
+            var arguments = ""
+        }
+        private var partials: [Int: Partial] = [:]
+        private var order: [Int] = []
+
+        init() {}
+
+        mutating func ingest(_ fragments: [[String: Any]]) {
+            for fragment in fragments {
+                let index = (fragment["index"] as? Int) ?? order.count
+                if partials[index] == nil {
+                    partials[index] = Partial()
+                    order.append(index)
+                }
+                guard var partial = partials[index] else { continue }
+                if let id = fragment["id"] as? String, !id.isEmpty { partial.id = id }
+                if let function = fragment["function"] as? [String: Any] {
+                    if let name = function["name"] as? String, !name.isEmpty { partial.name = name }
+                    if let arguments = function["arguments"] as? String { partial.arguments += arguments }
+                }
+                partials[index] = partial
+            }
+        }
+
+        /// Returns the completed calls in arrival order. Calls without a name
+        /// are dropped; calls without an id get a synthesised one so the
+        /// caller can still pair a result with them.
+        func finish() -> [(callId: String, name: String, arguments: String)] {
+            order.compactMap { index in
+                guard let partial = partials[index], !partial.name.isEmpty else { return nil }
+                let id = partial.id.isEmpty ? "call_\(index)_\(UUID().uuidString.prefix(8))" : partial.id
+                let arguments = partial.arguments.isEmpty ? "{}" : partial.arguments
+                return (callId: id, name: partial.name, arguments: arguments)
+            }
+        }
+    }
+
+    // MARK: - Chunked audio transcription (omni models)
+
+    /// Transcribes one WAV chunk by posting it to an omni chat model.
+    ///
+    /// Token Factory has no `/audio/transcriptions` endpoint; the omni models
+    /// instead accept an `audio_url` content part with a base64 data URI. The
+    /// model card recommends `temperature` ≈ 0.2, `top_k: 1` and
+    /// `chat_template_kwargs: {"enable_thinking": false}`; a server that
+    /// rejects one of those extras with a 400 gets one retry without them.
+    func transcribeAudioChunk(
+        wavData: Data,
+        model: String,
+        instruction: String,
+        maxTokens: Int? = nil,
+        usageCategory: AIUsageCategory = .transcription
+    ) async throws -> String {
+        guard Settings.shared.isAIEnabled else { throw OpenAIError.apiKeyMissing }
+
+        let dataURI = "data:audio/wav;base64,\(wavData.base64EncodedString())"
+        let content: [[String: Any]] = [
+            ["type": "audio_url", "audio_url": ["url": dataURI]],
+            ["type": "text", "text": instruction],
+        ]
+
+        func makeBody(includeTuningExtras: Bool) -> [String: Any] {
+            var body: [String: Any] = [
+                "model": model,
+                "messages": [["role": "user", "content": content] as [String: Any]],
+            ]
+            if let maxTokens { body["max_completion_tokens"] = maxTokens }
+            if includeTuningExtras {
+                body["temperature"] = 0.2
+                body["top_k"] = 1
+                body["chat_template_kwargs"] = ["enable_thinking": false]
+            }
+            return body
+        }
+
+        func send(_ body: [String: Any]) async throws -> ChatResponse {
+            let request = try makeRequest(path: "/chat/completions", body: body)
+            let data = try await performWithRetry(request: request)
+            return try decode(ChatResponse.self, from: data)
+        }
+
+        let response: ChatResponse
+        do {
+            response = try await send(makeBody(includeTuningExtras: true))
+        } catch OpenAIError.httpError(let status, let message) where status == 400 {
+            let lower = message.lowercased()
+            let namesExtra = lower.contains("top_k")
+                || lower.contains("chat_template_kwargs")
+                || lower.contains("temperature")
+                || lower.contains("extra")
+                || lower.contains("unknown")
+            guard namesExtra else {
+                throw OpenAIError.httpError(statusCode: status, message: message)
+            }
+            response = try await send(makeBody(includeTuningExtras: false))
+        }
+
+        if let usage = response.usage {
+            recordUsage(
+                model: model,
+                category: usageCategory,
+                inputTokens: usage.promptTokens,
+                outputTokens: usage.completionTokens,
+                cachedInputTokens: usage.promptTokensDetails?.cachedTokens ?? 0
+            )
+        }
+        // `ChatResponse` already strips `<think>` blocks on non-OpenAI providers.
+        return response.choices.first?.message.content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     /// Extracts the content delta from a single SSE chunk JSON object.
     private func extractStreamToken(from json: [String: Any]) -> String? {
         guard let choices = json["choices"] as? [[String: Any]],
@@ -729,7 +1041,10 @@ final class OpenAIClient {
 
         let request = try makeRequest(path: "/embeddings", body: body)
         let data = try await performWithRetry(request: request)
-        let response = try decode(EmbeddingResponse.self, from: data)
+        var response = try decode(EmbeddingResponse.self, from: data)
+        if let dimensions {
+            response = EmbeddingVectorAdapter.conform(response, to: dimensions)
+        }
         recordUsage(
             model: model,
             category: usageCategory,
@@ -802,7 +1117,9 @@ final class OpenAIClient {
 
     struct ModelInfo: Codable {
         let id: String
-        let ownedBy: String
+        /// Optional: Token Factory's `/models` listing omits `owned_by` on
+        /// some entries, and a hard requirement would fail the whole decode.
+        let ownedBy: String?
         enum CodingKeys: String, CodingKey {
             case id
             case ownedBy = "owned_by"
@@ -825,30 +1142,71 @@ final class OpenAIClient {
         return response.data.map { $0.id }.sorted()
     }
 
-    static let defaultChatModels = [
+    static let openAIChatModels = [
         "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4",
         "gpt-5-nano", "gpt-5-mini", "gpt-5",
         "gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1",
         "o4-mini", "o3", "o3-mini",
     ]
 
-    static let defaultEmbeddingModels = [
+    static let openAIEmbeddingModels = [
         "text-embedding-3-small", "text-embedding-3-large",
     ]
 
+    /// Nemotron / Qwen IDs offered before the live `/models` list is fetched.
+    static let nebiusChatModels = [
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+        "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning",
+    ]
+
+    static let nebiusEmbeddingModels = [
+        "Qwen/Qwen3-Embedding-8B",
+        "BAAI/bge-en-icl",
+    ]
+
+    /// Fallback chat models for the provider the user currently has selected.
+    static var defaultChatModels: [String] {
+        Settings.shared.isOpenAIProvider ? openAIChatModels : nebiusChatModels
+    }
+
+    /// Fallback embedding models for the provider the user currently has selected.
+    static var defaultEmbeddingModels: [String] {
+        Settings.shared.isOpenAIProvider ? openAIEmbeddingModels : nebiusEmbeddingModels
+    }
+
+    /// True for IDs that look like an embedding model on any provider —
+    /// OpenAI's `text-embedding-*` plus Token Factory's `Qwen/…-Embedding-…`,
+    /// `BAAI/bge-…` and `intfloat/e5-…` families.
+    static func looksLikeEmbeddingModel(_ model: String) -> Bool {
+        let lower = model.lowercased()
+        if lower.contains("embed") { return true }
+        if lower.contains("bge") { return true }
+        if lower.contains("/e5-") || lower.hasPrefix("e5-") { return true }
+        return false
+    }
+
+    /// Filters a `/models` listing down to IDs usable for chat completions.
+    ///
+    /// OpenAI IDs are matched by prefix (unchanged). Token Factory IDs are
+    /// namespaced (`nvidia/…`, `Qwen/…`, `BAAI/…`) — any namespaced ID is
+    /// treated as a chat model unless it looks like an embedding or a
+    /// non-chat modality.
     static func chatModels(from all: [String]) -> [String] {
         let prefixes = ["gpt-5", "gpt-4.1", "gpt-4o", "o3", "o4"]
-        let exclude = ["realtime", "audio", "search", "transcribe", "image", "moderation", "chatgpt", "codex", "oss"]
+        let exclude = ["realtime", "audio", "search", "transcribe", "image", "moderation", "chatgpt", "codex", "oss", "whisper", "rerank", "tts", "dall-e"]
         return all.filter { model in
             let lower = model.lowercased()
-            let hasPrefix = prefixes.contains { lower.hasPrefix($0) }
-            let excluded = exclude.contains { lower.contains($0) }
-            return hasPrefix && !excluded
+            if exclude.contains(where: { lower.contains($0) }) { return false }
+            if looksLikeEmbeddingModel(model) { return false }
+            if prefixes.contains(where: { lower.hasPrefix($0) }) { return true }
+            // Namespaced third-party ID (vendor/model) — Token Factory shape.
+            return model.contains("/")
         }
     }
 
     static func embeddingModels(from all: [String]) -> [String] {
-        all.filter { $0.lowercased().contains("embedding") }
+        all.filter { looksLikeEmbeddingModel($0) }
     }
 
     // MARK: - Private helpers

@@ -1,14 +1,22 @@
 import Foundation
 
-/// Minimal OpenAI embeddings client — just enough to embed a single search
-/// query so the CLI can compute cosine distances against `clip_embeddings`.
+/// Minimal OpenAI-compatible embeddings client — just enough to embed a single
+/// search query so the CLI can compute cosine distances against
+/// `clip_embeddings`.
 ///
 /// We don't reuse the app's `OpenAIClient` to keep the CLI lean and to avoid
 /// dragging in the larger AI service surface. The endpoint and request body
-/// match `OpenAIClient.embeddings(...)`.
+/// match `OpenAIClient.createEmbedding(...)`, including the base URL the app
+/// has configured (Nebius Token Factory by default) and the same 256-dimension
+/// truncation for models that ignore the `dimensions` parameter.
 enum EmbeddingClient {
 
-    private static let endpoint = URL(string: "https://api.openai.com/v1/embeddings")!
+    private static var endpoint: URL {
+        let base = BrainCacheConfig.aiBaseURL
+        let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
+        return URL(string: trimmed + "/embeddings")
+            ?? URL(string: BrainCacheConfig.nebiusBaseURL + "/embeddings")!
+    }
 
     static func embed(query: String, model: String, dimensions: Int? = nil) throws -> [Float] {
         guard let apiKey = BrainCacheConfig.openAIAPIKey() else {
@@ -69,7 +77,23 @@ enum EmbeddingClient {
             throw CLIError.openAIRequestFailed(status: http.statusCode, body: "unexpected response shape")
         }
 
-        return vector.map { Float($0) }
+        let floats = vector.map { Float($0) }
+        guard let dimensions else { return floats }
+        return conform(floats, to: dimensions)
+    }
+
+    /// Matryoshka truncation + L2 normalization, mirroring
+    /// `EmbeddingVectorAdapter` in the app: Qwen3-Embedding returns its full
+    /// 4096-dimension vector when the server ignores `dimensions`, and the
+    /// stored vectors are 256-dimensional.
+    static func conform(_ vector: [Float], to dimensions: Int) -> [Float] {
+        guard dimensions > 0, vector.count > dimensions else { return vector }
+        let truncated = Array(vector.prefix(dimensions))
+        var sumSquares: Float = 0
+        for value in truncated { sumSquares += value * value }
+        let magnitude = sumSquares.squareRoot()
+        guard magnitude > 0 else { return truncated }
+        return truncated.map { $0 / magnitude }
     }
 }
 

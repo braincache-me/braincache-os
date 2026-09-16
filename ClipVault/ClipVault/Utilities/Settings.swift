@@ -57,6 +57,61 @@ enum ActivityCaptureAudioMode: String, CaseIterable {
     case transcript
 }
 
+/// Which OpenAI-compatible backend the AI features talk to.
+///
+/// All three providers speak the same `/chat/completions`, `/embeddings` and
+/// `/models` surface; they differ in base URL, default model IDs, and which
+/// OpenAI-only extras (Responses API, realtime WebSocket transcription, the
+/// hosted `web_search` tool) are available.
+enum AIProvider: String, CaseIterable {
+    /// NVIDIA Nemotron models hosted on Nebius Token Factory (default).
+    case nebius
+    /// OpenAI's own API.
+    case openai
+    /// Any other OpenAI-compatible endpoint; the base URL is user-supplied.
+    case custom
+
+    /// Human-readable name for the Preferences popup.
+    var displayName: String {
+        switch self {
+        case .nebius: return "Nebius Token Factory"
+        case .openai: return "OpenAI"
+        case .custom: return "Custom"
+        }
+    }
+
+    /// Base URL used when the user hasn't overridden it. `custom` starts from
+    /// the OpenAI shape so a self-hosted gateway only needs the host swapped.
+    var defaultBaseURL: String {
+        switch self {
+        case .nebius: return "https://api.tokenfactory.nebius.com/v1"
+        case .openai: return "https://api.openai.com/v1"
+        case .custom: return "https://api.openai.com/v1"
+        }
+    }
+
+    /// Where the user goes to mint an API key for this provider.
+    var apiKeyURL: String {
+        switch self {
+        case .nebius: return "https://tokenfactory.nebius.com/"
+        case .openai: return "https://platform.openai.com/docs/api-reference/create-and-export-an-api-key"
+        case .custom: return "https://tokenfactory.nebius.com/"
+        }
+    }
+}
+
+/// Per-provider default model IDs. Every field stays user-editable in
+/// Preferences → AI; these are only the fallbacks used until the user picks
+/// something else (and the values "Reset to Defaults" restores).
+struct AIProviderModelDefaults: Equatable {
+    let chat: String
+    let classification: String
+    let vision: String
+    let embedding: String
+    let transcription: String
+    let translation: String
+}
+
 /// Typed UserDefaults accessors for app-wide settings.
 final class Settings {
 
@@ -201,9 +256,94 @@ final class Settings {
         set { defaults.set(newValue.rawValue, forKey: Keys.onboardingState) }
     }
 
-    // MARK: - AI / OpenAI
+    // MARK: - AI provider
 
-    /// OpenAI API key used for classification, embedding, and chat features.
+    /// Which OpenAI-compatible backend the AI features talk to.
+    ///
+    /// Changing the provider clears the stored model selections and the cached
+    /// `/models` list: a `gpt-*` ID pointed at Nebius (or a `nvidia/*` ID
+    /// pointed at OpenAI) would fail every request, so the model settings fall
+    /// back to the new provider's defaults instead.
+    var aiProvider: AIProvider {
+        get {
+            guard let raw = defaults.string(forKey: Keys.aiProvider),
+                  let provider = AIProvider(rawValue: raw) else {
+                return Defaults.aiProvider
+            }
+            return provider
+        }
+        set {
+            guard newValue != aiProvider else { return }
+            defaults.set(newValue.rawValue, forKey: Keys.aiProvider)
+            resetModelSelectionsForProviderChange()
+        }
+    }
+
+    /// Base URL of the OpenAI-compatible API (no trailing slash). Only the
+    /// `custom` provider persists a user-supplied value; the built-in
+    /// providers always resolve to their own endpoint.
+    var aiBaseURL: String {
+        get {
+            let provider = aiProvider
+            guard provider == .custom else { return provider.defaultBaseURL }
+            let stored = (defaults.string(forKey: Keys.aiBaseURL) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return stored.isEmpty ? provider.defaultBaseURL : stored
+        }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            defaults.set(trimmed, forKey: Keys.aiBaseURL)
+        }
+    }
+
+    /// True when requests go to OpenAI itself — the only provider that offers
+    /// the Responses API, realtime transcription sockets and hosted web search.
+    var isOpenAIProvider: Bool {
+        URL(string: aiBaseURL)?.host?.lowercased() == "api.openai.com"
+    }
+
+    /// Default model IDs for `provider`.
+    static func defaultModels(for provider: AIProvider) -> AIProviderModelDefaults {
+        switch provider {
+        case .nebius, .custom:
+            return AIProviderModelDefaults(
+                chat: "nvidia/nemotron-3-super-120b-a12b",
+                classification: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+                vision: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning",
+                embedding: "Qwen/Qwen3-Embedding-8B",
+                transcription: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning",
+                translation: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+            )
+        case .openai:
+            return AIProviderModelDefaults(
+                chat: "gpt-5.4-nano",
+                classification: "gpt-5.4-nano",
+                vision: "gpt-5.4-mini",
+                embedding: "text-embedding-3-small",
+                transcription: "gpt-realtime-whisper",
+                translation: "gpt-realtime-translate"
+            )
+        }
+    }
+
+    /// Model defaults for the provider currently selected.
+    var defaultModels: AIProviderModelDefaults { Self.defaultModels(for: aiProvider) }
+
+    /// Drops every stored model choice plus the cached `/models` list so the
+    /// getters fall through to the new provider's defaults.
+    private func resetModelSelectionsForProviderChange() {
+        for key in [Keys.chatModel, Keys.classificationModel, Keys.visionModel,
+                    Keys.embeddingModel, Keys.transcriptionModel, Keys.translationModel,
+                    Keys.voiceRewriteModel, Keys.writingRewriteModel, Keys.cachedModelList] {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    // MARK: - AI / API key
+
+    /// API key for the configured AI provider (Nebius Token Factory by
+    /// default). The storage key stays `openAIAPIKey` for backward
+    /// compatibility with keys saved by earlier builds.
     var openAIAPIKey: String {
         get { secretStore.string(forKey: Keys.openAIAPIKey) ?? "" }
         set {
@@ -216,7 +356,7 @@ final class Settings {
         }
     }
 
-    /// Returns true when an OpenAI API key has been configured.
+    /// Returns true when an AI provider API key has been configured.
     var isAIEnabled: Bool { !openAIAPIKey.isEmpty }
 
     // MARK: - AI Skill Bridge
@@ -250,35 +390,49 @@ final class Settings {
     // MARK: - AI Model Selection
 
     var chatModel: String {
-        get { defaults.string(forKey: Keys.chatModel) ?? Defaults.chatModel }
+        get { defaults.string(forKey: Keys.chatModel) ?? defaultModels.chat }
         set { defaults.set(newValue, forKey: Keys.chatModel) }
     }
 
     var classificationModel: String {
-        get { defaults.string(forKey: Keys.classificationModel) ?? Defaults.classificationModel }
+        get { defaults.string(forKey: Keys.classificationModel) ?? defaultModels.classification }
         set { defaults.set(newValue, forKey: Keys.classificationModel) }
     }
 
     var visionModel: String {
-        get { defaults.string(forKey: Keys.visionModel) ?? Defaults.visionModel }
+        get { defaults.string(forKey: Keys.visionModel) ?? defaultModels.vision }
         set { defaults.set(newValue, forKey: Keys.visionModel) }
     }
 
     var embeddingModel: String {
-        get { defaults.string(forKey: Keys.embeddingModel) ?? Defaults.embeddingModel }
+        get { defaults.string(forKey: Keys.embeddingModel) ?? defaultModels.embedding }
         set { defaults.set(newValue, forKey: Keys.embeddingModel) }
     }
 
     var transcriptionModel: String {
-        get { defaults.string(forKey: Keys.transcriptionModel) ?? Defaults.transcriptionModel }
+        get { defaults.string(forKey: Keys.transcriptionModel) ?? defaultModels.transcription }
         set { defaults.set(newValue, forKey: Keys.transcriptionModel) }
+    }
+
+    /// How many seconds of audio `ChunkedTranscriptionClient` buffers before
+    /// cutting a chunk and posting it to the omni model. Only used on
+    /// providers without a realtime WebSocket. Clamped to 4...60.
+    var chunkedTranscriptionWindowSeconds: Int {
+        get {
+            guard defaults.object(forKey: Keys.chunkedTranscriptionWindowSeconds) != nil else {
+                return Defaults.chunkedTranscriptionWindowSeconds
+            }
+            let stored = defaults.integer(forKey: Keys.chunkedTranscriptionWindowSeconds)
+            return stored == 0 ? Defaults.chunkedTranscriptionWindowSeconds : min(60, max(4, stored))
+        }
+        set { defaults.set(min(60, max(4, newValue)), forKey: Keys.chunkedTranscriptionWindowSeconds) }
     }
 
     /// Chat model used to clean up a freshly-recorded transcript before
     /// pasting (Option+Shift+Space flow). Falls back to the chat model so
     /// users get a sensible default the first time they trigger it.
     var voiceRewriteModel: String {
-        get { defaults.string(forKey: Keys.voiceRewriteModel) ?? Defaults.voiceRewriteModel }
+        get { defaults.string(forKey: Keys.voiceRewriteModel) ?? defaultModels.classification }
         set { defaults.set(newValue, forKey: Keys.voiceRewriteModel) }
     }
 
@@ -301,7 +455,7 @@ final class Settings {
 
     /// Realtime translation model. Defaults to OpenAI's gpt-realtime-translate.
     var translationModel: String {
-        get { defaults.string(forKey: Keys.translationModel) ?? Defaults.translationModel }
+        get { defaults.string(forKey: Keys.translationModel) ?? defaultModels.translation }
         set { defaults.set(newValue, forKey: Keys.translationModel) }
     }
 
@@ -651,7 +805,7 @@ final class Settings {
 
     /// Model used by the smart rewrite shortcut. Defaults to the chat model.
     var writingRewriteModel: String {
-        get { defaults.string(forKey: Keys.writingRewriteModel) ?? Defaults.writingRewriteModel }
+        get { defaults.string(forKey: Keys.writingRewriteModel) ?? defaultModels.chat }
         set { defaults.set(newValue, forKey: Keys.writingRewriteModel) }
     }
 
@@ -1221,6 +1375,8 @@ final class Settings {
         static let launchAtLogin     = "launchAtLogin"
         static let onboardingState   = "onboardingState"
         static let openAIAPIKey      = "openAIAPIKey"
+        static let aiProvider        = "aiProvider"
+        static let aiBaseURL         = "aiBaseURL"
         static let aiSkillBridgeEnabled = "aiSkillBridgeEnabled"
         static let aiSkillBridgePort = "aiSkillBridgePort"
         static let aiSkillBridgeToken = "aiSkillBridgeToken"
@@ -1229,6 +1385,7 @@ final class Settings {
         static let visionModel          = "visionModel"
         static let embeddingModel       = "embeddingModel"
         static let transcriptionModel   = "transcriptionModel"
+        static let chunkedTranscriptionWindowSeconds = "chunkedTranscriptionWindowSeconds"
         static let translationEnabled         = "translationEnabled"
         static let translationTargetLanguage  = "translationTargetLanguage"
         static let translationModel           = "translationModel"
@@ -1324,10 +1481,13 @@ final class Settings {
             onboardingState,
             aiSkillBridgeEnabled,
             aiSkillBridgePort,
+            aiProvider,
+            aiBaseURL,
             chatModel,
             classificationModel,
             visionModel,
             embeddingModel,
+            chunkedTranscriptionWindowSeconds,
             translationEnabled,
             translationTargetLanguage,
             translationModel,
@@ -1400,12 +1560,22 @@ final class Settings {
         static let chatHotkeyKeyCode: Int = 8
         /// command (0x100000) + shift (0x20000).
         static let chatHotkeyModifiers: UInt64 = 0x100000 | 0x20000
-        static let chatModel: String = "gpt-5.4-nano"
-        static let classificationModel: String = "gpt-5.4-nano"
-        static let visionModel: String = "gpt-5.4-mini"
-        static let embeddingModel: String = "text-embedding-3-small"
-        static let transcriptionModel: String = "gpt-realtime-whisper"
-        static let translationModel: String = "gpt-realtime-translate"
+        /// Nemotron on Nebius Token Factory is the shipping default; OpenAI
+        /// stays selectable in Preferences → AI.
+        static let aiProvider: AIProvider = .nebius
+        /// Model defaults are provider-dependent — see
+        /// `Settings.defaultModels(for:)`. These forward to the provider the
+        /// user currently has selected so "Reset to Defaults" restores the
+        /// right family of IDs.
+        static var chatModel: String { Settings.shared.defaultModels.chat }
+        static var classificationModel: String { Settings.shared.defaultModels.classification }
+        static var visionModel: String { Settings.shared.defaultModels.vision }
+        static var embeddingModel: String { Settings.shared.defaultModels.embedding }
+        static var transcriptionModel: String { Settings.shared.defaultModels.transcription }
+        static var translationModel: String { Settings.shared.defaultModels.translation }
+        /// Seconds of audio buffered before a chunk is cut and sent to the
+        /// omni model. Only used on providers without a realtime socket.
+        static let chunkedTranscriptionWindowSeconds: Int = 12
         static let translationTargetLanguage: String = "en"
 
         /// Languages currently accepted by the realtime translation endpoint.
@@ -1442,7 +1612,7 @@ final class Settings {
         /// Mirrors `chatModel` — the rewrite uses the same default chat model
         /// out of the box; users can override it to a smaller/cheaper one in
         /// Preferences → AI.
-        static let voiceRewriteModel: String = chatModel
+        static var voiceRewriteModel: String { Settings.shared.defaultModels.classification }
         /// Proactively rotate the realtime socket at this age. Keeps long
         /// recordings off the ~30 min server-side cap. See
         /// ``Settings.voiceSessionMaxAgeSeconds``. 25 min default.
@@ -1478,7 +1648,7 @@ final class Settings {
         // Writing Assistant
         static var writingRewritePrompt: String { Prompts.shared.writingAssistant.rewriteSystem }
         /// Mirror `chatModel` so the rewrite shortcut has a sensible default.
-        static var writingRewriteModel: String { chatModel }
+        static var writingRewriteModel: String { Settings.shared.defaultModels.chat }
         static let writingRewriteMaxOutputTokens: Int = 4096
 
         static let maxConversationCount: Int = 100

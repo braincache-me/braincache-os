@@ -118,7 +118,7 @@ final class ImageDescriberTests: XCTestCase {
     func testDescribeUsesCorrectModelAndDetail() async {
         MockURLProtocol.requestHandler = { request in
             let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
-            XCTAssertEqual(body["model"] as? String, "gpt-5.4-mini")
+            XCTAssertEqual(body["model"] as? String, Settings.shared.visionModel)
             let messages = body["messages"] as! [[String: Any]]
             // The last message should contain an image_url content block with detail "low"
             let lastMsg = messages.last!

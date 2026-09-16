@@ -364,7 +364,7 @@ final class AIIndexingPipeline {
             return .stopPipeline
 
         } catch OpenAIError.apiKeyMissing {
-            setState(.error("OpenAI API key is not configured."))
+            setState(.error("AI API key is not configured."))
             return .stopPipeline
 
         } catch {

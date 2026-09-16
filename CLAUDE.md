@@ -36,7 +36,14 @@ The repo contains four build artifacts plus tooling:
 
 ### Voice transcription
 
-`Services/VoiceTranscription/` drives live dictation: `VoiceTranscriptionRecorder` captures audio, one realtime WebSocket per source (mic + optional system audio) streams to `RealtimeTranscriptionClient` / `RealtimeTranslationClient`, and `VoiceTranscriptionService` (a `shared` singleton) surfaces partial/final transcripts. `FinalizeIntent` decides what happens to the result: `.paste`, `.skipPaste` (hand to AI window), or `.rewriteAndPaste` (LLM grammar cleanup, falling back to raw transcript on failure so dictation is never lost).
+`Services/VoiceTranscription/` drives live dictation: `VoiceTranscriptionRecorder` captures audio at 24 kHz mono PCM16, one client per source (mic + optional system audio) turns it into text, and `VoiceTranscriptionService` (a `shared` singleton) surfaces partial/final transcripts. `FinalizeIntent` decides what happens to the result: `.paste`, `.skipPaste` (hand to AI window), or `.rewriteAndPaste` (LLM grammar cleanup, falling back to raw transcript on failure so dictation is never lost).
+
+Which client runs is decided once, in `VoiceTranscriptionService.makeClient(source:)`, by `Settings.shared.isOpenAIProvider`. Both conform to `RealtimeAudioStreamingClient`, so everything downstream (finalize intents, transcript drafts, media recording, meeting detection) is identical either way:
+
+- **OpenAI** — `RealtimeTranscriptionClient` (or `RealtimeTranslationClient` when translation is on): one realtime WebSocket per source, streaming PCM.
+- **Every other provider** — `ChunkedTranscriptionClient`. Token Factory has no realtime socket, so audio is buffered and cut roughly every `Settings.chunkedTranscriptionWindowSeconds` (default 12) at the quietest 50 ms frame in the trailing ~1.5 s (`SilenceSplitFinder`, RMS-based, so words aren't sliced), resampled 24 kHz → 16 kHz, wrapped in a WAV header (`PCM16Audio`) and posted to the omni model as an `audio_url` data-URI content part. Chunks below a silence RMS threshold are dropped before they cost a request. At most 2 requests are in flight per source and `OrderedSegmentEmitter` releases results **in submission order**. Only completed segments are emitted — a placeholder partial would be frozen into its own transcript entry by the service's pause detection. Translation switches the chunk prompt to "Transcribe this audio and translate it to {language}." A single 5xx doesn't end a session: only `maxConsecutiveFailures` (3) in a row, a 401, or a missing key surfaces `onError`.
+
+`MeetingTranscriptRecorder` (Activity Capture's transcript mode) picks its client the same way.
 
 ### Voice panel — "Save recording" media file + crash-safe transcript drafts
 
@@ -121,6 +128,28 @@ All user-facing preferences are stored in `UserDefaults` via `Settings.swift`. K
 ### Pinned clips
 
 Pinned clips are ordered first in both `fetchRecent` and `search` (`ORDER BY is_pinned DESC, ...`). They are also excluded from all purge queries (`WHERE is_pinned = 0`).
+
+### AI provider abstraction — Nebius Token Factory by default
+
+Every AI feature talks to an **OpenAI-compatible** endpoint chosen by `Settings.aiProvider` (`AIProvider`: `nebius` — the default — `openai`, or `custom`). `Settings.aiBaseURL` resolves the endpoint (`https://api.tokenfactory.nebius.com/v1`, `https://api.openai.com/v1`, or a user-supplied URL — only `custom` persists an edited value), and `Settings.isOpenAIProvider` (host is `api.openai.com`) gates the OpenAI-only surfaces.
+
+`OpenAIClient` keeps its name but is provider-agnostic: it reads the base URL and the key from `Settings` at call time, so switching provider or rotating a key takes effect immediately. Changing `aiProvider` also **clears the stored model selections and `cachedModelList`**, so the getters fall back to the new provider's defaults instead of pointing a `gpt-*` ID at Nebius. Model defaults come from `Settings.defaultModels(for:)`; the storage key for the API key stays `openAIAPIKey` (Keychain service `com.clipvault.openai`) for backward compatibility — only the user-facing label is provider-neutral.
+
+What is **not** available outside OpenAI, and what happens instead:
+
+| OpenAI-only | On other providers |
+|---|---|
+| `POST /responses` (Ask AI) | `OpenAIClient.streamResponse` transparently falls back to a streaming chat completion that emits the same `ResponsesStreamEvent`s — see the Ask AI section |
+| hosted `{"type": "web_search"}` | skipped and logged by `ResponsesChatCompletionsBridge` |
+| `reasoning.summary` / `reasoning_effort` | omitted from the request body; the Reasoning Effort row is hidden in Preferences |
+| `wss://…/realtime` transcription | `ChunkedTranscriptionClient` (see Voice transcription) |
+| `POST /audio/transcriptions` | `OpenAIClient.transcribeAudioChunk` — a chat completion with an `audio_url` data URI |
+
+Nemotron reasoning models inline a `<think>…</think>` block in their output. `ThinkTagFilter` strips it — once in `ChatResponse.Message.init(from:)` for non-streamed calls, and incrementally in both streaming paths. The filter buffers across delta boundaries so a tag split between SSE chunks (`"<thi"` + `"nk>"`) is still removed.
+
+`OmniModelResolver` covers the least certain default: on a model-not-found error for the omni ID, it fetches `GET /models`, picks the first ID matching `/omni/i`, persists it into whichever Settings slot pointed at the bad ID, and the caller retries once.
+
+Embeddings are stored 256-dimensional. The request always sends `"dimensions": 256`; `EmbeddingVectorAdapter` truncates to the first 256 values and L2-normalizes client-side when the provider returns a longer vector (Qwen3-Embedding is natively 4096-dim with Matryoshka truncation).
 
 ### OpenAI integration — feature gating
 
@@ -236,6 +265,8 @@ The chat panel shows a "Searching…" status indicator during tool-call iteratio
 
 Ask AI (voice panel → AI Assist window) streams through `OpenAIClient.streamResponse` — the **Responses API** (`POST /v1/responses`) — not Chat Completions, because it is the only surface that streams reasoning summaries and hosts the built-in `web_search` tool. Everything else (RAG chat, classification, rewrite) stays on Chat Completions.
 
+**On non-OpenAI providers there is no `/responses`**, so `streamResponse` falls back to `streamResponseViaChatCompletions`, which produces the same event surface from a streaming chat completion. `ResponsesChatCompletionsBridge` does the pure translation: the flat Responses function schema becomes the nested `{type:"function",function:{…}}` shape, hosted tools are skipped and logged, and `input_text`/`input_image` blocks become `text`/`image_url` parts. There is no server-side conversation store, so instead of `previous_response_id` the message history is kept in `ResponsesChatSessionStore` (bounded to 16 turns) and addressed by a synthetic id returned in `.completed`; a continuation round replays that history plus the assistant message carrying `tool_calls` and one `role:"tool"` message per call — **every function call must get a result**. `OpenAIClient.StreamingToolCallAccumulator` reassembles `tool_calls` that arrive as indexed fragments. No `.reasoningDelta` is emitted (no reasoning summaries), so the thinking block stays empty apart from the tool-activity lines.
+
 - `ResponsesStreamParser` (own file, pure/testable) maps SSE JSON payloads to `ResponsesStreamEvent`: `.reasoningDelta` (`response.reasoning_summary_text.delta`), `.textDelta`, `.webSearchStarted`, `.functionCall`, `.completed(responseId:usage:)`, `.failed`.
 - Reasoning summaries are requested via `reasoning: {effort, summary: "auto"}` (effort comes from `Settings.reasoningEffort`, same gating as before). Some models/orgs reject `summary` — on a 400 naming it, the request retries once without the summary field so the answer still streams.
 - `AIAssistEntry.thinking` accumulates the trace; `AIAssistWindowController.thinkingBlock` renders it as a raw-HTML `<details>` block above the answer (open while the answer is empty, collapsed once tokens arrive). marked.js passes raw block HTML through unsanitised, so the text is escaped in Swift and newlines become `<br>`.
@@ -255,12 +286,19 @@ Tools are per-flag opt-in in Preferences → AI ("Ask AI Tools" section), assemb
 
 All RAG parameters are now in `Settings.swift` instead of hardcoded constants. `RAGEngine` reads them at call time:
 
+| Setting key | Default (`nebius`) | Default (`openai`) | Controls |
+|---|---|---|---|
+| `aiProvider` | nebius | — | `nebius` / `openai` / `custom`; changing it resets every model key below |
+| `aiBaseURL` | https://api.tokenfactory.nebius.com/v1 | https://api.openai.com/v1 | Endpoint; editable only for `custom` |
+| `chatModel` | nvidia/nemotron-3-super-120b-a12b | gpt-5.4-nano | Model for RAG / agentic chat / Ask AI / writing assistant |
+| `classificationModel` | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B | gpt-5.4-nano | Model for content classification (and the voice-rewrite default) |
+| `visionModel` | nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning | gpt-5.4-mini | Model for image description |
+| `embeddingModel` | Qwen/Qwen3-Embedding-8B | text-embedding-3-small | Model for embeddings (truncated to 256 dims) |
+| `transcriptionModel` | nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning | gpt-realtime-whisper | Voice transcription model |
+| `chunkedTranscriptionWindowSeconds` | 12 | — | Seconds of audio per chunk on providers without a realtime socket (4–60) |
+
 | Setting key | Default | Range | Controls |
 |---|---|---|---|
-| `chatModel` | gpt-5.4-nano | — | Model for RAG / agentic chat |
-| `classificationModel` | gpt-5.4-nano | — | Model for content classification |
-| `visionModel` | gpt-5.4-mini | — | Model for image description |
-| `embeddingModel` | text-embedding-3-small | — | Model for embeddings |
 | `ragTopK` | 20 | 5–50 | Candidate clips retrieved |
 | `ragMaxContextChars` | 24000 | 4000–64000 | Max chars injected as context |
 | `ragMaxOutputTokens` | 512 | 128–4096 | Max tokens in LLM response |
@@ -270,9 +308,9 @@ All RAG parameters are now in `Settings.swift` instead of hardcoded constants. `
 | `agenticSearchEnabled` | true | bool | Toggle agentic vs. classic RAG |
 | `maxConversationCount` | 100 | — | Oldest conversations deleted on launch if exceeded |
 
-Model names are never hardcoded in the AI service classes — `RAGEngine`, `AgenticRAGEngine`, `ContentClassifier`, `ImageDescriber`, and `EmbeddingGenerator` all read from `Settings.shared.*Model` at call time so model changes take effect immediately. The `cachedModelList` setting stores the full list of models fetched from `GET /v1/models` via `OpenAIClient.fetchAvailableModels()`.
+Model names are never hardcoded in the AI service classes — `RAGEngine`, `AgenticRAGEngine`, `ContentClassifier`, `ImageDescriber`, and `EmbeddingGenerator` all read from `Settings.shared.*Model` at call time so model changes take effect immediately. The `cachedModelList` setting stores the full list of models fetched from `GET /v1/models` via `OpenAIClient.fetchAvailableModels()`; `chatModels(from:)` / `embeddingModels(from:)` understand both OpenAI IDs and namespaced Token Factory IDs (`nvidia/…`, `Qwen/…`, `BAAI/…`, with embeddings recognised by "embed" / "bge" / "e5" in the ID).
 
-The AI Preferences tab exposes all of these across four sections: API Key, Model Selection (4 popup buttons + refresh), Chat Configuration (steppers/sliders), and Agentic Search. The entire tab is wrapped in an `NSScrollView` so all options are visible regardless of window size. A "Reset to Defaults" button resets all settings including model selections.
+The AI Preferences tab exposes all of these across five sections: AI Provider (provider popup + Base URL field, enabled only for `custom`), API Key (the "how to get a key" link follows the provider), Model Selection (popup buttons + refresh + the chunk-window stepper), Chat Configuration (steppers/sliders), and Agentic Search. The entire tab is wrapped in an `NSScrollView` so all options are visible regardless of window size. OpenAI-only rows (Reasoning Effort, the hosted web-search checkbox) are hidden and height-collapsed when another provider is selected. A "Reset to Defaults" button resets all settings, including model selections, to **the current provider's** defaults.
 
 ### Chat panel UX
 

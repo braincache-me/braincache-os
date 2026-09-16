@@ -273,10 +273,10 @@ final class RealtimeTranscriptionClient: NSObject {
     private func connect() {
         let key = Settings.shared.openAIAPIKey
         guard !key.isEmpty else {
-            log("connect aborted: OpenAI API key is not configured")
-            state = .failed("OpenAI API key is not configured.")
+            log("connect aborted: AI API key is not configured")
+            state = .failed("AI API key is not configured.")
             onError?(NSError(domain: "RealtimeTranscriptionClient", code: 401,
-                             userInfo: [NSLocalizedDescriptionKey: "OpenAI API key is not configured."]))
+                             userInfo: [NSLocalizedDescriptionKey: "AI API key is not configured."]))
             return
         }
 

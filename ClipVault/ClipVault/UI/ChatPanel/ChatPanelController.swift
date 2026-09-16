@@ -126,7 +126,7 @@ final class ChatPanelController: NSObject {
 
         guard Settings.shared.isAIEnabled else {
             appendMessage(ChatMessage(role: .assistant,
-                                      text: "AI features require an OpenAI API key. Configure it in Preferences > AI.",
+                                      text: "AI features require an API key. Configure it in Preferences > AI.",
                                       conversationId: currentConversationId))
             return
         }
@@ -839,7 +839,7 @@ final class ChatPanelController: NSObject {
 
         guard Settings.shared.isAIEnabled else {
             appendMessage(ChatMessage(role: .assistant,
-                                      text: "AI features require an OpenAI API key. Configure it in Preferences > AI."))
+                                      text: "AI features require an API key. Configure it in Preferences > AI."))
             return
         }
 

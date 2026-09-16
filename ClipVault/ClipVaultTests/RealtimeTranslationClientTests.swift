@@ -29,7 +29,7 @@ final class RealtimeTranslationClientTests: XCTestCase {
     }
 
     func testTranslationDefaultsAreSane() {
-        XCTAssertEqual(Settings.Defaults.translationModel, "gpt-realtime-translate")
+        XCTAssertEqual(Settings.defaultModels(for: .openai).translation, "gpt-realtime-translate")
         XCTAssertEqual(Settings.Defaults.translationTargetLanguage, "en")
     }
 }

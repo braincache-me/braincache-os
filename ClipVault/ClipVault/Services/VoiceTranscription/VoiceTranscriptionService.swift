@@ -279,7 +279,7 @@ final class VoiceTranscriptionService {
         }
 
         guard Settings.shared.isAIEnabled else {
-            setState(.error("OpenAI API key is not configured. Add one in Preferences → AI."))
+            setState(.error("AI API key is not configured. Add one in Preferences → AI."))
             return
         }
 
@@ -528,15 +528,29 @@ final class VoiceTranscriptionService {
     // MARK: - Realtime client wiring
 
     private func makeClient(source: RealtimeTranscriptionClient.Source) -> RealtimeAudioStreamingClient {
+        // Realtime WebSocket sessions exist only on OpenAI. Every other
+        // provider transcribes through `ChunkedTranscriptionClient`, which
+        // exposes the same surface but posts buffered WAV chunks to an omni
+        // chat model instead of streaming PCM to a socket.
         let client: RealtimeAudioStreamingClient
-        if Settings.shared.translationEnabled {
-            client = RealtimeTranslationClient(
-                source: source,
-                model: Settings.shared.translationModel,
-                targetLanguage: Settings.shared.translationTargetLanguage
-            )
+        if Settings.shared.isOpenAIProvider {
+            if Settings.shared.translationEnabled {
+                client = RealtimeTranslationClient(
+                    source: source,
+                    model: Settings.shared.translationModel,
+                    targetLanguage: Settings.shared.translationTargetLanguage
+                )
+            } else {
+                client = RealtimeTranscriptionClient(source: source, model: Settings.shared.transcriptionModel)
+            }
         } else {
-            client = RealtimeTranscriptionClient(source: source, model: Settings.shared.transcriptionModel)
+            client = ChunkedTranscriptionClient(
+                source: source,
+                model: Settings.shared.transcriptionModel,
+                targetLanguage: Settings.shared.translationEnabled
+                    ? Settings.shared.translationTargetLanguage
+                    : nil
+            )
         }
         client.onPartial = { [weak self] delta in
             guard let self else { return }

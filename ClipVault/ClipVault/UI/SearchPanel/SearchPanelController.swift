@@ -704,7 +704,7 @@ final class SearchPanelController: NSObject {
         }
         guard Settings.shared.isAIEnabled else {
             applyAskError(question: trimmed,
-                          message: "AI features require an OpenAI API key. Configure it in Preferences > AI.")
+                          message: "AI features require an API key. Configure it in Preferences > AI.")
             return
         }
 

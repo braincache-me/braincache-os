@@ -182,7 +182,7 @@ final class EmbeddingGeneratorTests: XCTestCase {
 
         MockURLProtocol.requestHandler = { request in
             let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
-            XCTAssertEqual(body["model"] as? String, "text-embedding-3-small")
+            XCTAssertEqual(body["model"] as? String, Settings.shared.embeddingModel)
             XCTAssertEqual(body["dimensions"] as? Int, 256)
             return (self.makeHTTPResponse(), self.embeddingResponseJSON())
         }

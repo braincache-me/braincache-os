@@ -84,7 +84,7 @@ directory. The CLI reads them directly:
 | SQLite database | `~/Library/Application Support/ClipVault/clipvault.db` |
 | Clipboard media (images, HTML, RTF) | `~/Library/Application Support/ClipVault/media/` |
 | Preferences (suite plist) | `~/Library/Preferences/com.clipvault.settings.plist` |
-| OpenAI API key | macOS Keychain, service `com.clipvault.openai` |
+| AI provider API key | macOS Keychain, service `com.clipvault.openai` (account `openAIAPIKey`, regardless of provider) |
 | Activity JSONL logs | user-chosen folder: `<root>/logs/YYYY-MM-DD.jsonl` |
 | Activity screenshots | `<root>/screenshots/YYYY-MM-DD/*.jpg` |
 | Activity summaries | `<root>/summaries/YYYY-MM-DD.json` |
@@ -115,20 +115,46 @@ braincache --dev info
 
 ### Authentication (vector search, AI)
 
-Vector search needs to embed your query against OpenAI's API. The CLI
-finds an API key in this order:
+Vector search embeds your query against whichever OpenAI-compatible API
+BrainCache is configured to use — NVIDIA Nemotron on **Nebius Token
+Factory** by default, or OpenAI / a custom endpoint if you changed the
+provider in Preferences → AI.
 
-1. `OPENAI_API_KEY` environment variable (overrides everything)
-2. The same Keychain item BrainCache stores (`com.clipvault.openai`)
-3. Legacy plaintext value in UserDefaults (pre-migration)
+The CLI finds an API key in this order:
+
+1. `NEBIUS_API_KEY` environment variable (overrides everything)
+2. `OPENAI_API_KEY` environment variable
+3. The same Keychain item BrainCache stores (`com.clipvault.openai`)
+4. Legacy plaintext value in UserDefaults (pre-migration)
 
 The first time the CLI reads from the Keychain, macOS asks for your
 permission with a system prompt — that's expected. Click "Always Allow"
 if you want subsequent runs to be silent.
 
 If no key is configured, vector search returns the friendly error
-`No OpenAI API key found.` and exits with code 1. FTS and grep searches
+`No AI API key found.` and exits with code 1. FTS and grep searches
 work without a key.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `NEBIUS_API_KEY` | API key for Nebius Token Factory (highest precedence). |
+| `OPENAI_API_KEY` | API key for OpenAI, or any other provider; used when `NEBIUS_API_KEY` is unset. |
+| `AI_BASE_URL` | Overrides the API base URL, e.g. `https://api.openai.com/v1`. Without it the CLI uses the provider the app has selected (`aiProvider` / `aiBaseURL` in the preferences suite), defaulting to `https://api.tokenfactory.nebius.com/v1`. |
+
+```sh
+# Talk to OpenAI for one command without touching the app's settings
+AI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=sk-… \
+  braincache clips search "github repo url" --mode vector
+```
+
+The embedding model follows the app's `embeddingModel` preference
+(`Qwen/Qwen3-Embedding-8B` on Nebius, `text-embedding-3-small` on
+OpenAI). Either way the CLI requests 256 dimensions and, if the provider
+returns a longer vector, truncates it to the first 256 values and
+re-normalizes it — matching how BrainCache stores vectors in
+`clip_embeddings`.
 
 ---
 
@@ -279,7 +305,7 @@ Search modes:
 | --- | --- | --- |
 | `fts` *(default)* | SQLite FTS5 phrase search across text and image descriptions. Ranked by relevance with a slight recency boost (same algorithm the BrainCache search panel uses). | No |
 | `grep` | NSRegularExpression match against `text_content` and `image_description`. Mirrors how `grep -E` would behave against the full text of every clip. Case-insensitive by default — pass `--case-sensitive`. Use `--fixed-strings` if you want a literal substring search instead of a regex. | No |
-| `vector` | Embeds the query with the same model BrainCache uses (default `text-embedding-3-small` @ 256 dims) and returns the top-K clips by cosine distance over the embeddings stored in `clip_embeddings`. | **Yes** |
+| `vector` | Embeds the query with the same model BrainCache uses (default `Qwen/Qwen3-Embedding-8B` @ 256 dims on Nebius, `text-embedding-3-small` on OpenAI) and returns the top-K clips by cosine distance over the embeddings stored in `clip_embeddings`. | **Yes** |
 | `hybrid` | Reciprocal Rank Fusion (k=60) of `fts` and `vector` results — what BrainCache's "Hybrid Search" UI does. Falls back gracefully to FTS-only if vector search fails (no key, no embeddings). | Preferred |
 
 Examples:
@@ -487,7 +513,7 @@ braincache clips search "next quarter goals" --mode hybrid --include-audio
 | Code | Meaning |
 | --- | --- |
 | 0 | Success. |
-| 1 | Generic error: missing DB, missing API key, unparseable date, no such clip/event, OpenAI error. The CLI prints a human-readable explanation to stderr. |
+| 1 | Generic error: missing DB, missing API key, unparseable date, no such clip/event, AI provider error. The CLI prints a human-readable explanation to stderr. |
 | 64 | Argument-parsing error (raised by ArgumentParser). Run with `--help` for usage. |
 
 NDJSON output is always written to stdout; errors and progress notes go
