@@ -1,147 +1,106 @@
-# ClipVault
+# BrainCache OS
 
-A native macOS clipboard manager that lives in the menu bar. Written entirely in Swift with AppKit.
+**Privacy-first activity recorder for macOS + Workflow Studio that turns real work logs into reviewed tasks, effort metrics and reusable agent skills. Powered by NVIDIA Nemotron on Nebius Token Factory.**
 
-## Features
+Built for the [Nebius x NVIDIA Global AI Hackathon](https://nebiusglobalaihackathon.devpost.com/) (Best Apps and Agents track). MIT licensed.
 
-- Monitors clipboard history and stores it in SQLite via GRDB.swift
-- Floating search panel accessible via a global hotkey (default: Cmd+Shift+V)
-- Full-text search with FTS5, blended with recency ranking
-- Supports text, RTF, HTML, images, and file URLs
-- Pin clips to keep them from being purged
-- Exclude specific apps from clipboard monitoring
-- Auto-purge by age and count limit
-- Universal binary (arm64 + x86_64)
+> Every company runs on workflows that live only in people's heads. BrainCache watches real work (with consent), understands it with open models running on infrastructure you control, and writes the playbook.
 
-### AI Features (requires OpenAI API key)
+## What is in this repo
 
-- Automatic classification and tagging of every clip using `gpt-5.4-nano` — tags like `code:swift`, `url`, `api-key`, `error-message` appear as coloured badges in search results
-- Vision-based description of image clips via `gpt-5.4-mini` — makes screenshots and diagrams full-text searchable
-- Vector embeddings via `text-embedding-3-small` (256 dimensions) stored in SQLite — enables semantic search
-- Hybrid search: keyword (FTS5) + semantic (vector similarity) results merged with Reciprocal Rank Fusion
-- "Chat with Clipboard" panel (Cmd+Shift+C) — ask natural-language questions; the app retrieves relevant clips via RAG and generates a grounded answer citing source clips
-- All AI features disabled gracefully when no API key is configured — no crashes, no API calls
+| Component | Path | What it does |
+|---|---|---|
+| **BrainCache for macOS** | `ClipVault/` | Native Swift/AppKit menu-bar app: clipboard history with hybrid search, activity recorder (clicks, shortcuts, window screenshots, meeting/voice transcripts), writing assistant, Ask AI. |
+| **`braincache` CLI** | `ClipVault/BrainCacheCLI/` | Read-only CLI over the on-disk SQLite DB and activity logs. Embedded in the app bundle. See [`docs/CLI.md`](docs/CLI.md). |
+| **Workflow Studio** | `braincache_server/` | Local Node.js + React console for team leads: drop in daily activity logs, a Nemotron agent infers business-outcome tasks, effort metrics and generates `SKILL.md` files. Transcribes meeting recordings with Nemotron 3 Nano Omni. |
+| **Demo dataset** | `demo_activity_ai_finance/` | A fictional month-end close workspace for recording a demo session (no real data). |
 
-## System Requirements
+## How NVIDIA Nemotron and Nebius Token Factory are used
 
-- macOS 13.0 or later
-- Xcode 16.0 or later (for building)
-- XcodeGen (for generating the Xcode project from project.yml)
+All inference goes through Nebius Token Factory's OpenAI-compatible API (`https://api.tokenfactory.nebius.com/v1`). Models are routed by job so the app stays responsive and credits stretch:
 
-## Dependencies
+| Job | Model | Why |
+|---|---|---|
+| Per-event labelling, clip classification, voice rewrite, quick chat follow-ups | **Nemotron 3 Nano** (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) | Thousands of small calls per day of logs; latency and cost matter more than depth. |
+| Agentic log analysis loop, skill authoring, RAG chat, writing assistant | **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) | Long context over event batches and dependable multi-round tool calling. |
+| Final cross-app goal assignment | **Nemotron 3 Ultra** (`nvidia/Nemotron-3-Ultra-550b-a55b`) | The one step where reasoning quality decides whether the extracted workflow is correct. |
+| Voice / meeting transcription, screenshot inspection, image description | **Nemotron 3 Nano Omni** (`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning`) | Omni-modal: audio is sent straight to the model through chat completions, no separate ASR service. |
+| Semantic search embeddings | `Qwen/Qwen3-Embedding-8B` on Token Factory, truncated to 256 dims (Matryoshka) | Keeps the existing 1 KB-per-clip vector store. |
 
-Managed via Swift Package Manager, declared in `project.yml`:
+Every model ID is configurable (environment variables for the server, Preferences → AI in the app). OpenAI remains available as an alternative provider so nothing regresses, but Nemotron on Nebius is the default.
 
-- [GRDB.swift](https://github.com/groue/GRDB.swift) >= 6.29.3 — SQLite wrapper with FTS5
-- [HotKey](https://github.com/soffes/HotKey) >= 0.2.0 — Global keyboard shortcuts
-- [Sparkle](https://github.com/sparkle-project/Sparkle) >= 2.0.0 — Auto-update framework
+### Where Token Factory accelerated the work
 
-## Building
+* One OpenAI-compatible endpoint serves Nano, Super, Ultra and Omni, so per-job routing is a model-name change and the same client code path serves all of them.
+* Streaming chat completions feed the live progress views in both the app and Workflow Studio.
+* Audio understanding through the Omni model replaced a proprietary realtime speech API: the Mac app now chunks microphone / system audio into short WAV segments and transcribes them with Nemotron, and Workflow Studio transcribes whole meeting recordings the same way.
 
-### Prerequisites
+## Quick start
 
-Install XcodeGen if you don't have it:
+### 1. Get a Nebius Token Factory key
 
+Create a key at [tokenfactory.nebius.com](https://tokenfactory.nebius.com/).
+
+```bash
+cp .env.example .env      # then put your key in NEBIUS_API_KEY
 ```
-brew install xcodegen
+
+### 2. Workflow Studio (server)
+
+Requires Node >= 22.5 (uses the built-in `node:sqlite`). No runtime npm dependencies.
+
+```bash
+cd braincache_server
+npm test          # unit tests (node --test)
+npm start         # http://127.0.0.1:8787
 ```
 
-### Generate and open the project
+Create a project, add one or more daily `YYYY-MM-DD.jsonl` activity logs (the Mac app writes them, or use any JSONL in the same event format), press **Initialize**, review the tasks, generate a skill. Use **Transcribe recordings** to run meeting recordings through Nemotron 3 Nano Omni so the agent can quote them.
 
-```
+Environment variables (see `.env.example`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEBIUS_API_KEY` | — | Token Factory API key (required for AI features; without it a heuristic analyzer runs) |
+| `NEBIUS_BASE_URL` | `https://api.tokenfactory.nebius.com/v1` | API base URL |
+| `NEMOTRON_FAST_MODEL` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | Nano |
+| `NEMOTRON_AGENT_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | Super |
+| `NEMOTRON_REASONING_MODEL` | `nvidia/Nemotron-3-Ultra-550b-a55b` | Ultra |
+| `NEMOTRON_OMNI_MODEL` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning` | Omni (audio + vision); auto-resolved from `GET /models` if the ID differs |
+
+### 3. macOS app
+
+Requires macOS 13+, Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen).
+
+```bash
 cd ClipVault
 xcodegen generate
-open ClipVault.xcodeproj
-```
-
-Then build with Cmd+B in Xcode, or from the command line:
-
-```
 xcodebuild build -scheme ClipVault -destination 'platform=macOS'
+# or run an isolated dev variant (separate bundle ID and data):
+./scripts/dev-run.sh
 ```
 
-## Running Tests
+Then open **Preferences → AI**, pick **Nebius Token Factory**, paste the key. The background pipeline starts classifying and embedding clipboard history, Ask AI and the writing assistant use Nemotron 3 Super, and the voice panel transcribes through Nemotron 3 Nano Omni.
 
-```
+Run the test suite (1,000+ tests):
+
+```bash
 cd ClipVault
 xcodebuild test -scheme ClipVault -destination 'platform=macOS'
 ```
 
-The test suite has 330 tests covering Storage, Monitor, UI, Services, and AI modules.
+## Privacy model
 
-## Distribution
+* Password fields are never captured; plain keystrokes are never stored (only shortcuts such as ⌘C).
+* Password managers and banking apps are excluded from capture by default; any app can be excluded.
+* Logs, screenshots and recordings stay in a folder the user picks. Nothing leaves the machine except the inference calls you configure.
+* The Mac app never records its own windows.
 
-### Build a DMG
+## Architecture notes
 
-```
-cd ClipVault
-bash scripts/build-dmg.sh
-```
+* Mac app: AppKit only (no SwiftUI), GRDB + SQLite FTS5, ScreenCaptureKit, CoreAudio process monitoring for meeting detection, AVAssetWriter with fragment intervals for crash-safe recordings. Details in [`CLAUDE.md`](CLAUDE.md).
+* Workflow Studio: single SQLite database via `node:sqlite`, agent loop with tools (`list_events`, `search_events`, `get_event_detail`, `inspect_screenshot`, `read_transcript`, `transcribe_recording`), SSE streaming to a no-build React UI. Details in [`braincache_server/README.md`](braincache_server/README.md).
 
-Requires `create-dmg` (`brew install create-dmg`) and a signed build.
+## License
 
-### Notarize
-
-```
-cd ClipVault
-bash scripts/notarize.sh ClipVault.app
-```
-
-Requires Apple Developer credentials configured via `xcrun notarytool store-credentials`.
-
-### Smoke test
-
-```
-cd ClipVault
-bash scripts/smoke-test.sh
-```
-
-Verifies the universal binary contains both arm64 and x86_64 slices.
-
-## Permissions
-
-ClipVault requires Accessibility access (System Settings > Privacy & Security > Accessibility) to simulate Cmd+V when pasting a clip back to another app. On first launch the app will prompt and open the relevant pane automatically.
-
-## Setting Up AI Features
-
-AI features require an OpenAI API key. Once configured, all features are enabled automatically with no additional setup.
-
-1. Open ClipVault Preferences (click the menu bar icon → Preferences)
-2. Go to the AI tab
-3. Paste your OpenAI API key and click "Validate"
-4. The background pipeline will start classifying and embedding your clipboard history
-
-### Approximate cost
-
-Based on typical clipboard usage (~100 clips/day, mix of short text and code snippets):
-
-| Operation | Cost per 1,000 clips |
-|---|---|
-| Classification (gpt-5.4-nano) | ~$0.05 |
-| Image description (gpt-5.4-mini, if images) | ~$0.10 per 1,000 images |
-| Embedding (text-embedding-3-small, 256 dims) | ~$0.001 |
-
-Most users spend well under $1/month. The pipeline never makes API calls without an explicit key, and you can pause or disable it from Preferences at any time.
-
-## Project Structure
-
-```
-ClipVault/
-  ClipVault/
-    App/            - AppDelegate, ClipVaultApp entry point, Info.plist
-    Monitor/        - ClipboardMonitor, PasteboardReader, ClipboardEntry
-    Storage/        - DatabaseManager, ClipStore, MediaFileManager
-    Services/       - HotkeyManager, PasteService, AppDetector, PurgeScheduler, SparkleUpdaterController
-      AI/           - OpenAIClient, ContentClassifier, ImageDescriber, EmbeddingGenerator, AIIndexingPipeline, VectorSearchEngine, RAGEngine
-    Storage/        - DatabaseManager, ClipStore, MediaFileManager, EmbeddingStore, VectorExtensionLoader
-    UI/
-      StatusMenu/   - StatusItemManager, StatusMenuBuilder
-      SearchPanel/  - SearchPanelController, SearchPanelWindow, ClipRowView, ClipPreviewView
-      ChatPanel/    - ChatPanelController, ChatPanelWindow, ChatBubbleView
-      Preferences/  - PreferencesWindowController and tab views (including AI tab)
-    Utilities/      - Settings, Hashing
-    Resources/      - Assets, entitlements
-  ClipVaultTests/   - Unit test suite
-  scripts/          - build-dmg.sh, notarize.sh, smoke-test.sh
-  project.yml       - XcodeGen project definition
-```
+MIT. See [`LICENSE`](LICENSE).
